@@ -52,7 +52,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     ])
 
     const transcriptionText = result.response.text()
-
+    console.log("Transcription completed")
     fs.unlinkSync(localFilePath)
 
     res.json({
