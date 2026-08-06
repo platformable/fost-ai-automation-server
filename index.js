@@ -37,9 +37,17 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     console.log("Generando transcripción. Esto puede tomar unos minutos...")
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" })
 
-    const prompt = `Generate a detailed and accurate transcription of this audio file in English. 
-        The audio is about 9 hours long but contains many silences. 
-        Skip the silences and structure the text with clear paragraphs. If there are multiple speakers, try to separate them by turns.`
+    const prompt = ` You are a professional transcription and document processing assistant.
+        The audio could be about 9 hours long but contains many silences. 
+      
+Your task is to transcribe the  audio accurately. Follow these strict rules to ensure high quality:
+
+NO DUPLICATION / NO LOOPING: Process the content strictly in chronological/sequential order. Never repeat a section, paragraph, phrase, or timestamp that has already been included. Ensure every part of the transcription appears exactly once.
+CONTINUOUS FLOW: Maintain a clean, linear flow from the beginning of the audio/text to the end without resetting or looping back to previous timestamps or topics.
+ACCURACY: Preserve technical terms, speaker names, numbers, and stats accurately.
+TRANSCRIPTION STYLE: Clean up verbal stutters/false starts if requested, but do not omit unique content.
+
+Deliver a single, complete, non-repetitive transcript from start to finish.`
 
     const result = await model.generateContent([
       {
