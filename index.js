@@ -35,7 +35,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     console.log(`Archivo subido con éxito: ${uploadResponse.file.uri}`)
 
     console.log("Generando transcripción. Esto puede tomar unos minutos...")
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" })
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" })
 
     const prompt = `Generate a detailed and accurate transcription of this audio file in English. 
         The audio is about 9 hours long but contains many silences. 
