@@ -14,26 +14,27 @@ const upload = multer({ dest: "uploads/" })
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY)
 
-app.post("/transcribe", upload.single("audioFile"), async (req, res) => {
-  console.log("File received:", req.file ? req.file.originalname : "None")
+app.post("/transcribe", upload.any(), async (req, res) => {
   try {
-    if (!req.file) {
+    if (!req.files || req.files.length === 0) {
       return res
         .status(400)
         .json({ error: "No se recibió ningún archivo de audio." })
     }
 
-    const localFilePath = req.file.path
-    const mimeType = req.file.mimetype
-    console.log(`Uploading to Gemini... (${req.file.originalname})`)
+    const uploadedFile = req.files[0]
+
+    const localFilePath = uploadedFile.path
+    const mimeType = uploadedFile.mimetype
+    console.log(`Subiendo archivo a Gemini... (${uploadedFile.originalname})`)
 
     const uploadResponse = await fileManager.uploadFile(localFilePath, {
       mimeType: mimeType,
-      displayName: req.file.originalname,
+      displayName: uploadedFile.originalname,
     })
-    console.log(`File uploaded successfully: ${uploadResponse.file.uri}`)
+    console.log(`Archivo subido con éxito: ${uploadResponse.file.uri}`)
 
-    console.log("Transcribing...")
+    console.log("Generando transcripción. Esto puede tomar unos minutos...")
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" })
 
     const prompt = `Generate a detailed and accurate transcription of this audio file in English. 
@@ -52,24 +53,18 @@ app.post("/transcribe", upload.single("audioFile"), async (req, res) => {
 
     const transcriptionText = result.response.text()
 
-    const outputFileName = `transcripcion_${Date.now()}.txt`
-    const outputPath = path.join(__dirname, outputFileName)
-    fs.writeFileSync(outputPath, transcriptionText)
-    console.log(`Transcription saved to: ${outputFileName}`)
-
     fs.unlinkSync(localFilePath)
 
     res.json({
       success: true,
-      message: "Complete transcription generated successfully.",
-      file: outputFileName,
-      preview: transcriptionText.substring(0, 500) + "...",
+      fileName: `transcripcion_${uploadedFile.originalname}.txt`,
+      transcription: transcriptionText,
     })
   } catch (error) {
-    console.error("Error occurred:", error)
+    console.error("Error durante el proceso:", error)
     res
       .status(500)
-      .json({ error: "An error occurred while processing the transcription." })
+      .json({ error: "Ocurrió un error al procesar la transcripción." })
   }
 })
 
