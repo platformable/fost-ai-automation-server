@@ -83,12 +83,6 @@ app.post("/clean-transcription", async (req, res) => {
   console.log("req.body:", req.body)
   /* console.log(`Cleaning transcription for file: ${fileName}`) */
   try {
-    if (!req.files || req.files.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "No se recibió ningún archivo de transcripción." })
-    }
-
     /* const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" })
 
     const prompt = `You are a professional transcription and document processing assistant.
