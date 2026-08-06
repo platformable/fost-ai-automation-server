@@ -9,6 +9,9 @@ const { GoogleAIFileManager } = require("@google/generative-ai/server")
 
 const app = express()
 
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
+
 const upload = multer({ dest: "uploads/" })
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
@@ -80,7 +83,6 @@ app.post("/clean-transcription", async (req, res) => {
   console.log("Cleaning transcription request received")
   //const { fileName, transcriptionText } = req.body
 
-  console.log("req.body:", req.body)
   /* console.log(`Cleaning transcription for file: ${fileName}`) */
   try {
     /* const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" })
