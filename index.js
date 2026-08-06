@@ -86,7 +86,7 @@ app.post("/clean-transcription", async (req, res) => {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" })
 
-    const prompt = ` Please review the attached transcript document and perform the following tasks carefully.
+    const prompt = `Please review the attached transcript document and perform the following tasks carefully.
 1. Clean the Transcript
 Remove any text that is clearly not part of the speaker's actual spoken words, such as transcription artifacts, notes, editing marks, duplicated fragments, incomplete transcription tags, stray characters, or other non-spoken content.
 Correct obvious transcription errors, including:
