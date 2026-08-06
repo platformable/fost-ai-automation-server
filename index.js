@@ -77,10 +77,11 @@ Deliver a single, complete, non-repetitive transcript from start to finish.`
 })
 
 app.post("/clean-transcription", async (req, res) => {
+  console.log("Cleaning transcription request received")
   const { fileName, transcriptionText } = req.body
 
   console.log("req.body:", req.body)
-  console.log(`Cleaning transcription for file: ${fileName}`)
+  /* console.log(`Cleaning transcription for file: ${fileName}`) */
   try {
     if (!req.files || req.files.length === 0) {
       return res
