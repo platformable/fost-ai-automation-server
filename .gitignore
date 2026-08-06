@@ -2,3 +2,10 @@
 .env
 /node_modules
 node_modules/
+/french1
+/french2
+/french3
+/morgan3
+/old
+/uploads
+compose.yml
