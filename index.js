@@ -90,7 +90,6 @@ app.post("/clean-transcription", async (req, res) => {
   }
 
   try {
-    // 1. Definimos el esquema estricto
     const responseSchema = {
       type: SchemaType.ARRAY,
       items: {
@@ -119,7 +118,7 @@ app.post("/clean-transcription", async (req, res) => {
     }
 
     const model = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash",
+      model: "gemini-1.5-flash-latest",
       generationConfig: {
         responseMimeType: "application/json",
         responseSchema: responseSchema,
