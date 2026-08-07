@@ -79,7 +79,7 @@ Deliver a single, complete, non-repetitive transcript from start to finish.`
   }
 })
 
-aapp.post("/clean-transcription", async (req, res) => {
+app.post("/clean-transcription", async (req, res) => {
   console.log("Cleaning transcription request received")
 
   // 1. Receive sheetData from n8n
