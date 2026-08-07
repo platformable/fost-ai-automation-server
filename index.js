@@ -4,7 +4,7 @@ const fs = require("fs")
 const path = require("path")
 require("dotenv").config()
 
-const { GoogleGenerativeAI } = require("@google/generative-ai")
+const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai")
 const { GoogleAIFileManager } = require("@google/generative-ai/server")
 
 const app = express()
@@ -81,8 +81,6 @@ Deliver a single, complete, non-repetitive transcript from start to finish.`
 
 app.post("/clean-transcription", async (req, res) => {
   console.log("Cleaning transcription request received")
-
-  // 1. Receive sheetData from n8n
   const { fileName, transcriptionText, sheetData } = req.body
 
   if (!sheetData) {
@@ -92,77 +90,63 @@ app.post("/clean-transcription", async (req, res) => {
   }
 
   try {
-    // 2. Force JSON output directly in the model configuration
+    // 1. Definimos el esquema estricto
+    const responseSchema = {
+      type: SchemaType.ARRAY,
+      items: {
+        type: SchemaType.OBJECT,
+        properties: {
+          id: { type: SchemaType.STRING },
+          speaker: { type: SchemaType.STRING },
+          metadata: {
+            type: SchemaType.OBJECT,
+            properties: {
+              conference: { type: SchemaType.STRING },
+              date: { type: SchemaType.STRING },
+              title: { type: SchemaType.STRING },
+              role: { type: SchemaType.STRING },
+              organization: { type: SchemaType.STRING },
+              topics: {
+                type: SchemaType.ARRAY,
+                items: { type: SchemaType.STRING },
+              },
+            },
+          },
+          cleaned_content: { type: SchemaType.STRING },
+        },
+        required: ["id", "speaker", "metadata", "cleaned_content"],
+      },
+    }
+
     const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
+      model: "gemini-1.5-flash",
       generationConfig: {
         responseMimeType: "application/json",
+        responseSchema: responseSchema,
       },
     })
 
-    // Convert the sheet array into a string so Gemini can read it
     const sheetDataString = JSON.stringify(sheetData)
 
-    const prompt = `Please review the attached transcript document and perform the following tasks carefully.
+    const prompt = `Please review the attached transcript and perform the following tasks carefully.
+
 1. Clean the Transcript
-Remove any text that is clearly not part of the speaker's actual spoken words, such as transcription artifacts, notes, editing marks, duplicated fragments, incomplete transcription tags, stray characters, or other non-spoken content.
-Correct obvious transcription errors, including:
-words split incorrectly (e.g., "w-write")
-obvious spelling mistakes
-obvious grammar or transcription mistakes that make the sentence unreadable
-incomplete words caused by transcription issues
-Do not rewrite, paraphrase, summarize, or improve the speaker's wording.
-Preserve the speaker's original text and phrasing as much as possible.
-Only make corrections when the text is clearly incorrect, incomplete, or unintelligible.
-Maintain all existing formatting, including colors, highlights, emphasis, headings, spacing, and overall document structure.
+- Remove any text that is clearly not part of the speaker's actual spoken words.
+- Correct obvious transcription errors, including split words and spelling mistakes.
+- Do NOT rewrite, paraphrase, summarize, or improve the speaker's wording.
 
 2. Separate Content by Speaker & Match Metadata
 - Identify each speaker in the transcript.
-- CRITICAL - AGGREGATE CONTENT: If a speaker speaks multiple times throughout the transcript, you MUST combine all of their spoken segments into ONE SINGLE JSON object for that speaker. Do not create duplicate objects for the same person.
+- CRITICAL - AGGREGATE CONTENT: If a speaker speaks multiple times, combine all of their spoken segments into ONE SINGLE string for that speaker. Do not create duplicate objects.
 - STRICT MATCHING: Use the provided JSON spreadsheet data as the absolute source of truth. 
-- You must ONLY output speakers whose names exactly match the spreadsheet or can be definitively linked to it. 
-- DO NOT invent, guess, or modify last names. If the transcript says "John" and there are two "Johns" in the spreadsheet, use context to pick the right one. If you cannot definitively determine who it is, do not invent a last name.
-- DO NOT hallucinate or create speakers that do not exist in the source data.
+- DO NOT invent, guess, or modify last names. 
 
-
-3. Quality Assurance Checklist
-Before finalizing each speaker document:
-Verify that only the selected speaker's content is included.
-Verify that all metadata matches the corresponding row in the French Forum 1 (91 PAX) sheet.
-Verify that speaker names have been standardized using the spreadsheet values.
-Verify that titles, roles, and organizations come from the spreadsheet, not from the transcript.
-Verify that all formatting from the source document has been preserved.
-Verify that no speaker wording has been unnecessarily rewritten.
-Verify that all obvious transcription artifacts have been removed.
-Verify that the document remains faithful to the original spoken content.
-Verify that the generated topics accurately reflect the content of the speaker's remarks.
-Output one clean, finalized document per speaker.
-
-4. OUTPUT FORMAT
-You must return the response SOLELY and EXCLUSIVELY as a valid JSON array of objects.
-Do not output standard text documents. The JSON object for each speaker will act as their "document".
+3. Generate Topics
+- Create 10-20 highly relevant, searchable topic tags for each speaker.
 
 Here is the Reference Spreadsheet Data (Source of Truth):
-${sheetDataString}
+${sheetDataString}`
 
- The JSON schema must strictly follow this structure:
-[
-  {
-    "id": "talk-XX-apidaysny26", 
-    "speaker": "Official Name from Spreadsheet",
-    "metadata": {
-      "conference": "Apidays New York 2026",
-      "date": "May 13, 2026",
-      "title": "Talk Title from Spreadsheet",
-      "role": "Role from Spreadsheet",
-      "organization": "Organization from Spreadsheet",
-      "topics": ["Topic 1", "Topic 2", "Topic 3"]
-    },
-    "cleaned_content": "The fully cleaned, direct text."
-  }
-]`
-
-    // Send both the transcript and the prompt
     const result = await model.generateContent([
       { text: `TRANSCRIPT TO CLEAN:\n${transcriptionText}` },
       { text: prompt },
@@ -171,22 +155,7 @@ ${sheetDataString}
     const cleanedTranscriptionText = result.response.text()
     console.log("Transcription cleaning completed")
 
-    const sanitizeJSONString = (rawString) => {
-      return rawString.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
-    }
-
-    const sanitizedText = sanitizeJSONString(cleanedTranscriptionText)
-    let finalData
-    try {
-      finalData = JSON.parse(sanitizedText)
-    } catch (parseError) {
-      console.error("JSON Parse Error. Texto recibido:", sanitizedText)
-
-      return res.status(500).json({
-        error: "El modelo devolvió un JSON inválido.",
-        details: parseError.message,
-      })
-    }
+    const finalData = JSON.parse(cleanedTranscriptionText)
 
     res.json({
       success: true,
@@ -195,11 +164,13 @@ ${sheetDataString}
     })
   } catch (error) {
     console.error("Error during the cleaning process:", error)
-    res
-      .status(500)
-      .json({ error: "An error occurred while cleaning the transcription." })
+    res.status(500).json({
+      error: "An error occurred while cleaning the transcription.",
+      details: error.message,
+    })
   }
 })
+
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
   console.log(`Transcription server running at http://localhost:${PORT}`)
