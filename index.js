@@ -116,15 +116,16 @@ Preserve the speaker's original text and phrasing as much as possible.
 Only make corrections when the text is clearly incorrect, incomplete, or unintelligible.
 Maintain all existing formatting, including colors, highlights, emphasis, headings, spacing, and overall document structure.
 
-3.Standardize the speaker name using the spelling found in the ${sheetDataString}
-Use the corresponding talk title, role, and organization from the same row in the sheet.
-If multiple similar names exist, use the transcript content and session context to determine the correct match.
-Treat the spreadsheet as the source of truth whenever there is a discrepancy between the transcript and the sheet.
-Do not leave speaker information blank because of minor spelling or transcription differences.
-If the transcript speaker name is partially incorrect, replace it with the official version from the sheet.
-Example:If the transcript contains "Rahul Durega" and the sheet contains "Rahul Dureja", use "Rahul Dureja" and the associated session information from the sheet.
+2. Separate Content by Speaker & Match Metadata
+- Identify each speaker in the transcript.
+- CRITICAL - AGGREGATE CONTENT: If a speaker speaks multiple times throughout the transcript, you MUST combine all of their spoken segments into ONE SINGLE JSON object for that speaker. Do not create duplicate objects for the same person.
+- STRICT MATCHING: Use the provided JSON spreadsheet data as the absolute source of truth. 
+- You must ONLY output speakers whose names exactly match the spreadsheet or can be definitively linked to it. 
+- DO NOT invent, guess, or modify last names. If the transcript says "John" and there are two "Johns" in the spreadsheet, use context to pick the right one. If you cannot definitively determine who it is, do not invent a last name.
+- DO NOT hallucinate or create speakers that do not exist in the source data.
 
-4. Quality Assurance Checklist
+
+3. Quality Assurance Checklist
 Before finalizing each speaker document:
 Verify that only the selected speaker's content is included.
 Verify that all metadata matches the corresponding row in the French Forum 1 (91 PAX) sheet.
@@ -137,7 +138,7 @@ Verify that the document remains faithful to the original spoken content.
 Verify that the generated topics accurately reflect the content of the speaker's remarks.
 Output one clean, finalized document per speaker.
 
-5. OUTPUT FORMAT
+4. OUTPUT FORMAT
 You must return the response SOLELY and EXCLUSIVELY as a valid JSON array of objects.
 Do not output standard text documents. The JSON object for each speaker will act as their "document".
 
