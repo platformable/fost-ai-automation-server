@@ -157,6 +157,8 @@ STEP 5 - Generate topics
 
 - Only include people who have actual spoken lines transcribed as their own turn. Do NOT include people who are merely mentioned, thanked, or referenced by others but never speak themselves.
 
+- do not include Host/Moderator or unknown speakers in the final output. Only include speakers with actual spoken lines.
+
 Here is the Reference Spreadsheet Data (for metadata matching only, NOT for determining who the speakers are):
 ${sheetDataString}`
 
