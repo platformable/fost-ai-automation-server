@@ -4,7 +4,10 @@ const fs = require("fs")
 const path = require("path")
 require("dotenv").config()
 
-const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai")
+const {
+  GoogleGenerativeAI,
+  SchemaType,
+} = require("@google/generative-ai@latest")
 const { GoogleAIFileManager } = require("@google/generative-ai/server")
 
 const app = express()
@@ -127,23 +130,34 @@ app.post("/clean-transcription", async (req, res) => {
 
     const sheetDataString = JSON.stringify(sheetData)
 
-    const prompt = `Please review the attached transcript and perform the following tasks carefully.
+    const prompt = `Please review the attached transcript and perform the following tasks carefully, IN THIS ORDER.
 
-1. Clean the Transcript
-- Remove any text that is clearly not part of the speaker's actual spoken words.
+STEP 1 - Identify speakers from the TRANSCRIPT ONLY
+- Read the transcript and determine how many DISTINCT people actually speak (e.g. host + 1 guest = 2 speakers).
+- Do NOT use the spreadsheet data to decide who the speakers are. The spreadsheet is only used later, for metadata lookup.
+- The number of objects you return MUST equal the number of distinct speakers you found in the transcript. If there are 2 people speaking, return exactly 2 objects. Never generate one object per spreadsheet row.
+- Only include people who have actual spoken lines transcribed as their own turn. Do NOT include people who are merely mentioned, thanked, or referenced by others but never speak themselves.
+
+STEP 2 - Clean the transcript
+- Remove any text that is clearly not part of the speaker's actual spoken words (filler noise, transcription artifacts).
 - Correct obvious transcription errors, including split words and spelling mistakes.
 - Do NOT rewrite, paraphrase, summarize, or improve the speaker's wording.
 
-2. Separate Content by Speaker & Match Metadata
-- Identify each speaker in the transcript.
-- CRITICAL - AGGREGATE CONTENT: If a speaker speaks multiple times, combine all of their spoken segments into ONE SINGLE string for that speaker. Do not create duplicate objects.
-- STRICT MATCHING: Use the provided JSON spreadsheet data as the absolute source of truth. 
-- DO NOT invent, guess, or modify last names. 
+STEP 3 - Aggregate content per speaker
+- CRITICAL: If a speaker talks multiple times throughout the transcript, merge ALL of their segments into ONE single "cleaned_content" string, in chronological order.
+- Never create two objects for the same person. One object = one unique person.
 
-3. Generate Topics
-- Create 10-20 highly relevant, searchable topic tags for each speaker.
+STEP 4 - Match metadata using the spreadsheet (source of truth for METADATA ONLY)
+- For each speaker identified in STEP 1, look up their matching row in the spreadsheet data below to fill in "metadata" (conference, date, title, role, organization).
+- Match by name similarity. Do NOT invent, guess, or modify last names.
+- If a speaker from the transcript has no match in the spreadsheet, still include them with whatever metadata fields you can infer as null/empty, but do NOT skip them and do NOT add extra people who are in the spreadsheet but don't appear in the transcript.
 
-Here is the Reference Spreadsheet Data (Source of Truth):
+STEP 5 - Generate topics
+- Create 10-20 highly relevant, searchable topic tags for each speaker based on their actual spoken content.
+
+- Only include people who have actual spoken lines transcribed as their own turn. Do NOT include people who are merely mentioned, thanked, or referenced by others but never speak themselves.
+
+Here is the Reference Spreadsheet Data (for metadata matching only, NOT for determining who the speakers are):
 ${sheetDataString}`
 
     const result = await model.generateContent([
@@ -154,7 +168,50 @@ ${sheetDataString}`
     const cleanedTranscriptionText = result.response.text()
     console.log("Transcription cleaning completed")
 
-    const finalData = JSON.parse(cleanedTranscriptionText)
+    let finalData = JSON.parse(cleanedTranscriptionText)
+
+    // --- Safety net: dedupe + merge by speaker in case the model still splits someone into multiple objects ---
+    const originalCount = finalData.length
+    const mergedBySpeaker = new Map()
+
+    for (const entry of finalData) {
+      // Normalize name for matching (lowercase, trim, collapse spaces)
+      const key = (entry.speaker || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+
+      if (!key) continue // skip entries with no speaker name at all
+
+      if (mergedBySpeaker.has(key)) {
+        const existing = mergedBySpeaker.get(key)
+        // Merge cleaned_content chronologically
+        existing.cleaned_content =
+          `${existing.cleaned_content} ${entry.cleaned_content}`.trim()
+        // Merge topics without duplicates
+        const existingTopics = existing.metadata?.topics || []
+        const newTopics = entry.metadata?.topics || []
+        existing.metadata.topics = [
+          ...new Set([...existingTopics, ...newTopics]),
+        ]
+        // Fill in any missing metadata fields from the duplicate, if the first one had them empty
+        existing.metadata = {
+          ...entry.metadata,
+          ...existing.metadata,
+          topics: existing.metadata.topics,
+        }
+      } else {
+        mergedBySpeaker.set(key, entry)
+      }
+    }
+
+    finalData = Array.from(mergedBySpeaker.values())
+
+    if (finalData.length !== originalCount) {
+      console.warn(
+        `⚠️ Speaker dedupe kicked in for "${fileName}": model returned ${originalCount} objects, merged down to ${finalData.length}. Check the transcript/prompt if this keeps happening.`,
+      )
+    }
 
     res.json({
       success: true,
