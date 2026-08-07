@@ -170,8 +170,22 @@ ${sheetDataString}
     const cleanedTranscriptionText = result.response.text()
     console.log("Transcription cleaning completed")
 
-    // Parse the JSON string from Gemini into an actual JavaScript object
-    const finalData = JSON.parse(cleanedTranscriptionText)
+    const sanitizeJSONString = (rawString) => {
+      return rawString.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "")
+    }
+
+    const sanitizedText = sanitizeJSONString(cleanedTranscriptionText)
+    let finalData
+    try {
+      finalData = JSON.parse(sanitizedText)
+    } catch (parseError) {
+      console.error("JSON Parse Error. Texto recibido:", sanitizedText)
+
+      return res.status(500).json({
+        error: "El modelo devolvió un JSON inválido.",
+        details: parseError.message,
+      })
+    }
 
     res.json({
       success: true,
