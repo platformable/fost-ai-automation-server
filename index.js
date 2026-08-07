@@ -4,10 +4,7 @@ const fs = require("fs")
 const path = require("path")
 require("dotenv").config()
 
-const {
-  GoogleGenerativeAI,
-  SchemaType,
-} = require("@google/generative-ai@latest")
+const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai")
 const { GoogleAIFileManager } = require("@google/generative-ai/server")
 
 const app = express()
