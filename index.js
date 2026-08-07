@@ -143,6 +143,9 @@ STEP 2 - Clean the transcript
 STEP 3 - Aggregate content per speaker
 - CRITICAL: If a speaker talks multiple times throughout the transcript, merge ALL of their segments into ONE single "cleaned_content" string, in chronological order.
 - Never create two objects for the same person. One object = one unique person.
+- Do not create objects for people who are mentioned but never speak. Only include speakers with actual spoken lines.
+- Do not invent, guess, or modify last names. If a speaker's last name is not clear in the transcript, leave it blank or null.
+- Do not create objects for "host" or "moderator".
 
 STEP 4 - Match metadata using the spreadsheet (source of truth for METADATA ONLY)
 - For each speaker identified in STEP 1, look up their matching row in the spreadsheet data below to fill in "metadata" (conference, date, title, role, organization).
