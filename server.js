@@ -10,7 +10,7 @@ require("dotenv").config()
 
 const { Agent, setGlobalDispatcher } = require("undici")
 
-const { GoogleGenerativeAI } = require("@google/generative-ai")
+const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai")
 
 const { GoogleAIFileManager } = require("@google/generative-ai/server")
 
