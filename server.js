@@ -2,15 +2,15 @@ const express = require("express")
 const multer = require("multer")
 const fs = require("fs")
 const path = require("path")
+const crypto = require("crypto")
 const { execFile } = require("child_process")
 const { promisify } = require("util")
-const crypto = require("crypto")
 
 require("dotenv").config()
 
 const { Agent, setGlobalDispatcher } = require("undici")
 
-const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai")
+const { GoogleGenerativeAI } = require("@google/generative-ai")
 
 const { GoogleAIFileManager } = require("@google/generative-ai/server")
 
@@ -43,13 +43,17 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY)
 
 // --------------------------------------------------
-// CONFIGURACIÓN DEL PROCESAMIENTO
+// TRANSCRIPTION CONFIG
 // --------------------------------------------------
 
-const CHUNK_DURATION = 15 * 60 // 15 minutos
+// Cada chunk tendrá 15 minutos.
+// 9 horas ≈ 36 chunks.
+const CHUNK_DURATION = 15 * 60
 
+// Número de transcripciones simultáneas.
 const MAX_CONCURRENCY = 3
 
+// Número de intentos por chunk.
 const MAX_RETRIES = 3
 
 // --------------------------------------------------
@@ -57,7 +61,9 @@ const MAX_RETRIES = 3
 // --------------------------------------------------
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
 function ensureDirectory(directory) {
@@ -76,13 +82,13 @@ function removeDirectory(directory) {
 }
 
 // --------------------------------------------------
-// FFMPEG
+// SPLIT AUDIO
 // --------------------------------------------------
 
 async function splitAudio(inputPath, outputDirectory) {
   ensureDirectory(outputDirectory)
 
-  console.log("Iniciando FFmpeg...")
+  console.log("Dividiendo audio con FFmpeg...")
 
   await execFileAsync("ffmpeg", [
     "-hide_banner",
@@ -107,14 +113,13 @@ async function splitAudio(inputPath, outputDirectory) {
     "-b:a",
     "64k",
 
-    // Segmentar cada 15 minutos
+    // Crear segmentos
     "-f",
     "segment",
 
     "-segment_time",
     String(CHUNK_DURATION),
 
-    // Nombres
     "-segment_start_number",
     "0",
 
@@ -127,53 +132,13 @@ async function splitAudio(inputPath, outputDirectory) {
     .sort()
     .map((file) => path.join(outputDirectory, file))
 
-  console.log(`FFmpeg terminó. ${chunks.length} chunks creados.`)
+  console.log(`Audio dividido en ${chunks.length} chunks.`)
 
   return chunks
 }
 
 // --------------------------------------------------
-// GEMINI
-// --------------------------------------------------
-
-const transcriptionSchema = {
-  type: SchemaType.OBJECT,
-
-  properties: {
-    segments: {
-      type: SchemaType.ARRAY,
-
-      items: {
-        type: SchemaType.OBJECT,
-
-        properties: {
-          start: {
-            type: SchemaType.NUMBER,
-          },
-
-          end: {
-            type: SchemaType.NUMBER,
-          },
-
-          speaker: {
-            type: SchemaType.STRING,
-          },
-
-          text: {
-            type: SchemaType.STRING,
-          },
-        },
-
-        required: ["start", "end", "speaker", "text"],
-      },
-    },
-  },
-
-  required: ["segments"],
-}
-
-// --------------------------------------------------
-// SUBIR ARCHIVO A GEMINI
+// UPLOAD TO GEMINI
 // --------------------------------------------------
 
 async function uploadToGemini(filePath, chunkNumber) {
@@ -196,81 +161,58 @@ async function uploadToGemini(filePath, chunkNumber) {
   }
 
   if (fileState.state === "FAILED") {
-    throw new Error(`Gemini falló procesando chunk ${chunkNumber}`)
+    throw new Error(`Gemini no pudo procesar el chunk ${chunkNumber}`)
   }
 
   return fileState
 }
 
 // --------------------------------------------------
-// TRANSCRIBIR CHUNK
+// TRANSCRIBE ONE CHUNK
 // --------------------------------------------------
 
 async function transcribeChunk(filePath, chunkNumber) {
-  const startTime = chunkNumber * CHUNK_DURATION
-
-  console.log(`[Chunk ${chunkNumber}] Iniciando transcripción...`)
-
-  const file = await uploadToGemini(filePath, chunkNumber)
-
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
-  })
-
-  const prompt = `
-You are a professional conference transcription system.
-
-This audio is ONE SEGMENT of a much longer conference recording.
-
-Transcribe ONLY the speech contained in this audio segment.
-
-IMPORTANT:
-
-1. Preserve the chronological order.
-2. Do not summarize.
-3. Do not invent missing information.
-4. Do not repeat content.
-5. Preserve technical terminology.
-6. Preserve names, numbers, statistics and product names.
-7. Identify different speakers.
-8. If the real identity of a speaker is unknown, use:
-   SPEAKER_01
-   SPEAKER_02
-   SPEAKER_03
-   etc.
-9. Do not guess the real names of speakers.
-10. Remove obvious verbal fillers such as "um", "uh", etc. when they do not add meaning.
-11. Do not remove meaningful content.
-12. Provide timestamps relative to the beginning of THIS audio segment.
-13. Start timestamps at approximately 0 seconds.
-14. End timestamps at the actual end of the spoken segment.
-15. Do not create timestamps for silence.
-16. Return every meaningful spoken section.
-17. Do not describe the audio.
-18. Do not provide a summary.
-
-The timestamps MUST be expressed as numbers in seconds.
-
-For example:
-
-{
-  "segments": [
-    {
-      "start": 12.4,
-      "end": 25.8,
-      "speaker": "SPEAKER_01",
-      "text": "This is the actual transcription."
-    }
-  ]
-}
-
-Return ONLY the structured transcription.
-`
-
   let lastError
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
+      console.log(`[Chunk ${chunkNumber}] Transcribiendo...`)
+
+      const file = await uploadToGemini(filePath, chunkNumber)
+
+      const model = genAI.getGenerativeModel({
+        model: "gemini-2.5-flash",
+      })
+
+      const prompt = `
+You are a professional conference transcription system.
+
+This audio is ONE SEGMENT of a longer conference recording.
+
+Transcribe ALL spoken content contained in this audio segment.
+
+Rules:
+
+- Preserve the chronological order.
+- Do not summarize.
+- Do not omit meaningful spoken content.
+- Preserve technical terminology.
+- Preserve names, numbers, statistics and product names accurately.
+- Remove obvious verbal fillers and stutters when they do not add meaning.
+- Do not invent information.
+- Do not reconstruct missing words or sentences.
+- Do not repeat content.
+- Do not describe the audio.
+- Do not provide commentary.
+- Do not provide a summary.
+- Return only the transcription.
+
+This is only one segment of a larger recording.
+Do not assume this is the beginning or the end of the conference.
+
+Return the clean transcription as plain text.
+`
+
       const result = await model.generateContent({
         contents: [
           {
@@ -280,6 +222,7 @@ Return ONLY the structured transcription.
               {
                 fileData: {
                   mimeType: file.mimeType,
+
                   fileUri: file.uri,
                 },
               },
@@ -292,44 +235,30 @@ Return ONLY the structured transcription.
         ],
 
         generationConfig: {
-          responseMimeType: "application/json",
-
-          responseSchema: transcriptionSchema,
-
           temperature: 0,
         },
       })
 
-      const text = result.response.text()
+      const transcription = result.response.text()
 
-      const parsed = JSON.parse(text)
-
-      // Convert timestamps from
-      // chunk-relative to global timestamps.
-      const segments = parsed.segments.map((segment) => ({
-        start: Number((startTime + segment.start).toFixed(3)),
-
-        end: Number((startTime + segment.end).toFixed(3)),
-
-        speaker: segment.speaker,
-
-        text: segment.text.trim(),
-      }))
+      if (!transcription) {
+        throw new Error("Gemini devolvió una transcripción vacía.")
+      }
 
       console.log(`[Chunk ${chunkNumber}] Transcripción completada.`)
 
       return {
         chunk: chunkNumber,
-        startTime,
-        segments,
+        transcription: transcription.trim(),
       }
     } catch (error) {
       lastError = error
 
       console.error(
-        `[Chunk ${chunkNumber}] Error en intento ${attempt}/${MAX_RETRIES}:`,
-        error.message,
+        `[Chunk ${chunkNumber}] Error. Intento ${attempt}/${MAX_RETRIES}`,
       )
+
+      console.error(error.message)
 
       if (attempt < MAX_RETRIES) {
         await sleep(5000 * attempt)
@@ -341,7 +270,7 @@ Return ONLY the structured transcription.
 }
 
 // --------------------------------------------------
-// PROCESAMIENTO CONCURRENTE
+// PROCESS CHUNKS WITH CONCURRENCY
 // --------------------------------------------------
 
 async function processChunks(chunks) {
@@ -357,19 +286,9 @@ async function processChunks(chunks) {
         return
       }
 
-      const chunkPath = chunks[index]
-
       console.log(`[Worker ${workerId}] Procesando chunk ${index}`)
 
-      try {
-        results[index] = await transcribeChunk(chunkPath, index)
-      } catch (error) {
-        console.error(
-          `[Worker ${workerId}] Chunk ${index} falló definitivamente.`,
-        )
-
-        throw error
-      }
+      results[index] = await transcribeChunk(chunks[index], index)
     }
   }
 
@@ -386,21 +305,18 @@ async function processChunks(chunks) {
 }
 
 // --------------------------------------------------
-// MERGE
+// MERGE TRANSCRIPTIONS
 // --------------------------------------------------
 
 function mergeTranscriptions(results) {
-  const segments = results
+  return results
     .sort((a, b) => a.chunk - b.chunk)
-    .flatMap((result) => result.segments)
-
-  return {
-    segments,
-  }
+    .map((result) => result.transcription)
+    .join("\n\n")
 }
 
 // --------------------------------------------------
-// ENDPOINT
+// TRANSCRIBE ENDPOINT
 // --------------------------------------------------
 
 app.post("/transcribe", upload.any(), async (req, res) => {
@@ -410,6 +326,10 @@ app.post("/transcribe", upload.any(), async (req, res) => {
   let processingDirectory
 
   try {
+    // ------------------------------------------
+    // VALIDATE FILE
+    // ------------------------------------------
+
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({
         error: "No se recibió ningún archivo de audio.",
@@ -424,24 +344,24 @@ app.post("/transcribe", upload.any(), async (req, res) => {
 
     ensureDirectory(processingDirectory)
 
+    console.log("")
     console.log("========================================")
-
-    console.log(`JOB: ${jobId}`)
-
+    console.log("NUEVA TRANSCRIPCIÓN")
+    console.log("========================================")
+    console.log(`Job: ${jobId}`)
     console.log(`Archivo: ${uploadedFile.originalname}`)
-
     console.log(`MIME: ${uploadedFile.mimetype}`)
-
     console.log("========================================")
+    console.log("")
 
     // ------------------------------------------
-    // 1. DIVIDIR AUDIO
+    // 1. SPLIT AUDIO
     // ------------------------------------------
 
     const chunks = await splitAudio(localFilePath, processingDirectory)
 
     // ------------------------------------------
-    // 2. TRANSCRIBIR
+    // 2. TRANSCRIBE CHUNKS
     // ------------------------------------------
 
     const results = await processChunks(chunks)
@@ -450,23 +370,30 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     // 3. MERGE
     // ------------------------------------------
 
-    const transcript = mergeTranscriptions(results)
+    const transcription = mergeTranscriptions(results)
 
     // ------------------------------------------
-    // 4. GUARDAR JSON
+    // 4. SAVE TXT
     // ------------------------------------------
 
     const outputFile = path.join(
       processingDirectory,
-      `transcripcion_${jobId}.json`,
+      `transcripcion_${jobId}.txt`,
     )
 
-    fs.writeFileSync(outputFile, JSON.stringify(transcript, null, 2))
+    fs.writeFileSync(outputFile, transcription, "utf8")
 
-    console.log(`Transcripción completa: ${outputFile}`)
+    console.log("")
+    console.log("========================================")
+    console.log("TRANSCRIPCIÓN COMPLETADA")
+    console.log("========================================")
+    console.log(`Chunks: ${chunks.length}`)
+    console.log(`Archivo: ${outputFile}`)
+    console.log("========================================")
+    console.log("")
 
     // ------------------------------------------
-    // 5. LIMPIAR AUDIO ORIGINAL
+    // 5. DELETE ORIGINAL UPLOAD
     // ------------------------------------------
 
     if (localFilePath && fs.existsSync(localFilePath)) {
@@ -474,7 +401,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     }
 
     // ------------------------------------------
-    // 6. RESPUESTA
+    // 6. RESPONSE
     // ------------------------------------------
 
     return res.json({
@@ -486,17 +413,14 @@ app.post("/transcribe", upload.any(), async (req, res) => {
 
       chunks: chunks.length,
 
-      segments: transcript.segments.length,
-
-      transcription: transcript,
+      transcription,
     })
   } catch (error) {
+    console.error("")
     console.error("========================================")
-
-    console.error("ERROR DE TRANSCRIPCIÓN")
-
+    console.error("ERROR DURANTE LA TRANSCRIPCIÓN")
+    console.error("========================================")
     console.error(error)
-
     console.error("========================================")
 
     if (localFilePath && fs.existsSync(localFilePath)) {
@@ -515,11 +439,8 @@ app.post("/transcribe", upload.any(), async (req, res) => {
       jobId,
     })
   } finally {
-    // Eliminamos los chunks después
-    // de terminar el procesamiento.
-    //
-    // Si quieres conservarlos para debugging,
-    // puedes comentar esta línea.
+    // Limpiar chunks temporales
+    // después de terminar.
 
     if (processingDirectory) {
       removeDirectory(processingDirectory)
