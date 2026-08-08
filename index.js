@@ -3,6 +3,14 @@ const multer = require("multer")
 const fs = require("fs")
 const path = require("path")
 require("dotenv").config()
+const { Agent, setGlobalDispatcher } = require("undici")
+
+setGlobalDispatcher(
+  new Agent({
+    headersTimeout: 1200000,
+    bodyTimeout: 1200000,
+  }),
+)
 
 const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai")
 const { GoogleAIFileManager } = require("@google/generative-ai/server")
@@ -64,20 +72,22 @@ TRANSCRIPTION STYLE: Clean up verbal stutters/false starts if requested, but do 
 
 Deliver a single, complete, non-repetitive transcript from start to finish.`
 
-    const result = await model.generateContent(
-      [
-        {
-          fileData: {
-            mimeType: uploadResponse.file.mimeType,
-            fileUri: uploadResponse.file.uri,
-          },
+    const result = await model.generateContentStream([
+      {
+        fileData: {
+          mimeType: uploadResponse.file.mimeType,
+          fileUri: uploadResponse.file.uri,
         },
-        { text: prompt },
-      ],
-      { timeout: 900000 },
-    )
+      },
+      { text: prompt },
+    ])
 
-    const transcriptionText = result.response.text()
+    let transcriptionText = ""
+    for await (const chunk of result.stream) {
+      const chunkText = chunk.text()
+      transcriptionText += chunkText
+    }
+
     console.log("Transcription completed")
     fs.unlinkSync(localFilePath)
 
