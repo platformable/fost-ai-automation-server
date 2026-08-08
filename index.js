@@ -38,6 +38,18 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     console.log(`Archivo subido con éxito: ${uploadResponse.file.uri}`)
 
     console.log("Generando transcripción. Esto puede tomar unos minutos...")
+
+    let fileState = uploadResponse.file
+    while (fileState.state === "PROCESSING") {
+      console.log("Archivo aún procesándose, esperando 10s...")
+      await new Promise((resolve) => setTimeout(resolve, 10000))
+      fileState = await fileManager.getFile(uploadResponse.file.name)
+    }
+
+    if (fileState.state === "FAILED") {
+      throw new Error("El procesamiento del archivo en Gemini falló.")
+    }
+
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" })
 
     const prompt = ` You are a professional transcription and document processing assistant.
@@ -52,15 +64,18 @@ TRANSCRIPTION STYLE: Clean up verbal stutters/false starts if requested, but do 
 
 Deliver a single, complete, non-repetitive transcript from start to finish.`
 
-    const result = await model.generateContent([
-      {
-        fileData: {
-          mimeType: uploadResponse.file.mimeType,
-          fileUri: uploadResponse.file.uri,
+    const result = await model.generateContent(
+      [
+        {
+          fileData: {
+            mimeType: uploadResponse.file.mimeType,
+            fileUri: uploadResponse.file.uri,
+          },
         },
-      },
-      { text: prompt },
-    ])
+        { text: prompt },
+      ],
+      { timeout: 900000 },
+    )
 
     const transcriptionText = result.response.text()
     console.log("Transcription completed")
@@ -73,9 +88,12 @@ Deliver a single, complete, non-repetitive transcript from start to finish.`
     })
   } catch (error) {
     console.error("Error durante el proceso:", error)
-    res
-      .status(500)
-      .json({ error: "Ocurrió un error al procesar la transcripción." })
+    console.error("Causa:", error.cause)
+    res.status(500).json({
+      error: "Ocurrió un error al procesar la transcripción.",
+      details: error.message,
+      cause: error.cause,
+    })
   }
 })
 
