@@ -29,18 +29,18 @@ const app = express()
 
 app.use(
   express.json({
-    limit: "50mb",
+    limit: "150mb",
   }),
 )
 
 app.use(
   express.urlencoded({
     extended: true,
-    limit: "50mb",
+    limit: "150mb",
   }),
 )
 
-const PORT = process.env.PORT || 3000
+const PORT = process.env.PORT || 5000
 
 const upload = multer({
   dest: "uploads/",
@@ -657,14 +657,517 @@ app.post("/transcribe", upload.any(), async (req, res) => {
   }
 })
 
+// --------------------------------------------------
+// CLEAN TRANSCRIPTION
+// --------------------------------------------------
+
+const CLEAN_CHUNK_SIZE = 25000
+
+const CLEAN_MAX_CONCURRENCY = 3
+
+const CLEAN_MAX_RETRIES = 3
+
+// --------------------------------------------------
+// SPLIT TRANSCRIPT INTO TEXT CHUNKS
+// --------------------------------------------------
+
+function splitTranscript(text, maxChars = CLEAN_CHUNK_SIZE) {
+  const chunks = []
+
+  let current = ""
+
+  // Intentamos cortar por párrafos/frases,
+  // no arbitrariamente en mitad de una palabra.
+  const paragraphs = text.split(/\n+/)
+
+  for (const paragraph of paragraphs) {
+    const cleanParagraph = paragraph.trim()
+
+    if (!cleanParagraph) {
+      continue
+    }
+
+    // Si el párrafo individual es demasiado grande,
+    // lo cortamos por frases.
+    if (cleanParagraph.length > maxChars) {
+      const sentences = cleanParagraph.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [
+        cleanParagraph,
+      ]
+
+      for (const sentence of sentences) {
+        const cleanSentence = sentence.trim()
+
+        if (!cleanSentence) {
+          continue
+        }
+
+        if (current.length + cleanSentence.length + 1 > maxChars) {
+          if (current) {
+            chunks.push(current.trim())
+          }
+
+          current = cleanSentence
+        } else {
+          current += " " + cleanSentence
+        }
+      }
+
+      continue
+    }
+
+    if (current.length + cleanParagraph.length + 2 > maxChars) {
+      if (current) {
+        chunks.push(current.trim())
+      }
+
+      current = cleanParagraph
+    } else {
+      current += (current ? "\n\n" : "") + cleanParagraph
+    }
+  }
+
+  if (current) {
+    chunks.push(current.trim())
+  }
+
+  return chunks
+}
+
+// --------------------------------------------------
+// RETRY HELPER
+// --------------------------------------------------
+
+async function runGeminiWithRetry(callback, label) {
+  let lastError
+
+  for (let attempt = 1; attempt <= CLEAN_MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[${label}] Gemini attempt ${attempt}/${CLEAN_MAX_RETRIES}`)
+
+      return await callback()
+    } catch (error) {
+      lastError = error
+
+      console.error(`[${label}] Error:`, error.message)
+
+      if (attempt < CLEAN_MAX_RETRIES) {
+        await sleep(3000 * attempt)
+      }
+    }
+  }
+
+  throw lastError
+}
+
+// --------------------------------------------------
+// CLEAN ONE TRANSCRIPT CHUNK
+// --------------------------------------------------
+
+async function cleanTranscriptChunk(transcriptChunk, chunkNumber) {
+  const responseSchema = {
+    type: SchemaType.OBJECT,
+
+    properties: {
+      cleaned_content: {
+        type: SchemaType.STRING,
+      },
+    },
+
+    required: ["cleaned_content"],
+  }
+
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
+
+    generationConfig: {
+      responseMimeType: "application/json",
+
+      responseSchema,
+
+      temperature: 0,
+    },
+  })
+
+  const prompt = `
+You are cleaning one segment of a conference transcript.
+
+Your ONLY task is to clean the transcript.
+
+Rules:
+
+- Preserve all meaningful spoken content.
+- Preserve the original meaning.
+- Preserve chronological order.
+- Remove filler words such as:
+  "um", "uh", "erm", "you know", etc.
+- Remove obvious transcription artifacts.
+- Remove accidental duplicated words.
+- Correct obvious spelling errors.
+- Correct obvious transcription mistakes when the intended word is clear.
+- Correct obvious split words.
+- Preserve technical terminology.
+- Preserve names.
+- Preserve company names.
+- Preserve product names.
+- Preserve numbers and statistics.
+- Do NOT summarize.
+- Do NOT paraphrase.
+- Do NOT rewrite the speaker's ideas.
+- Do NOT add information.
+- Do NOT invent information.
+- Do NOT remove meaningful repetition.
+- Return ONLY the cleaned transcript.
+
+This is only one part of a larger transcript.
+Do not add introductions or conclusions.
+
+Return the cleaned content as a single string.
+`
+
+  return runGeminiWithRetry(async () => {
+    const result = await model.generateContent([
+      {
+        text: prompt,
+      },
+      {
+        text: "TRANSCRIPT SEGMENT:\n\n" + transcriptChunk,
+      },
+    ])
+
+    const raw = result.response.text()
+
+    if (!raw) {
+      throw new Error("Gemini returned an empty response.")
+    }
+
+    let parsed
+
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      throw new Error("Gemini returned invalid JSON while cleaning chunk.")
+    }
+
+    if (!parsed.cleaned_content) {
+      throw new Error("Gemini returned empty cleaned_content.")
+    }
+
+    console.log(
+      `[Clean chunk ${chunkNumber}] Completed (${parsed.cleaned_content.length} chars)`,
+    )
+
+    return {
+      chunk: chunkNumber,
+
+      cleaned_content: parsed.cleaned_content.trim(),
+    }
+  }, `Clean chunk ${chunkNumber}`)
+}
+
+// --------------------------------------------------
+// PROCESS CLEANING CHUNKS
+// --------------------------------------------------
+
+async function cleanTranscriptChunks(chunks) {
+  const results = new Array(chunks.length)
+
+  let currentIndex = 0
+
+  async function worker(workerId) {
+    while (true) {
+      const index = currentIndex++
+
+      if (index >= chunks.length) {
+        return
+      }
+
+      console.log(
+        `[Clean worker ${workerId}] Processing chunk ${index + 1}/${chunks.length}`,
+      )
+
+      results[index] = await cleanTranscriptChunk(chunks[index], index)
+    }
+  }
+
+  const workers = Array.from(
+    {
+      length: Math.min(CLEAN_MAX_CONCURRENCY, chunks.length),
+    },
+    (_, index) => worker(index + 1),
+  )
+
+  await Promise.all(workers)
+
+  return results
+}
+
+// --------------------------------------------------
+// FINAL SPEAKER EXTRACTION
+// --------------------------------------------------
+
+async function extractSpeakers(cleanedTranscript, sheetData) {
+  const responseSchema = {
+    type: SchemaType.ARRAY,
+
+    items: {
+      type: SchemaType.OBJECT,
+
+      properties: {
+        id: {
+          type: SchemaType.STRING,
+        },
+
+        speaker: {
+          type: SchemaType.STRING,
+        },
+
+        metadata: {
+          type: SchemaType.OBJECT,
+
+          properties: {
+            conference: {
+              type: SchemaType.STRING,
+            },
+
+            date: {
+              type: SchemaType.STRING,
+            },
+
+            title: {
+              type: SchemaType.STRING,
+            },
+
+            role: {
+              type: SchemaType.STRING,
+            },
+
+            organization: {
+              type: SchemaType.STRING,
+            },
+
+            topics: {
+              type: SchemaType.ARRAY,
+
+              items: {
+                type: SchemaType.STRING,
+              },
+            },
+          },
+
+          required: [
+            "conference",
+            "date",
+            "title",
+            "role",
+            "organization",
+            "topics",
+          ],
+        },
+
+        cleaned_content: {
+          type: SchemaType.STRING,
+        },
+      },
+
+      required: ["id", "speaker", "metadata", "cleaned_content"],
+    },
+  }
+
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
+
+    generationConfig: {
+      responseMimeType: "application/json",
+
+      responseSchema,
+
+      temperature: 0,
+    },
+  })
+
+  const sheetDataString = JSON.stringify(sheetData, null, 2)
+
+  const prompt = `
+You are analyzing a cleaned conference transcript.
+
+Your task is to identify the REAL SPEAKERS who actually speak
+and associate them with the provided reference metadata.
+
+IMPORTANT:
+
+The transcript is the source of truth for determining
+who actually speaks.
+
+The reference data is ONLY the source of truth for metadata.
+
+Do NOT add people simply because they exist in the reference data.
+
+==================================================
+SPEAKER IDENTIFICATION
+==================================================
+
+Identify the distinct people who actually speak.
+
+Normally a conference contains approximately 4-5 speakers,
+but DO NOT force this number.
+
+If only 3 people actually speak, return 3.
+
+If 4 people speak, return 4.
+
+If 5 people speak, return 5.
+
+Do not invent speakers.
+
+Do not include people who are merely mentioned.
+
+Do not include people who are thanked but never speak.
+
+Do not include hosts.
+
+Do not include moderators.
+
+Do not include interviewers.
+
+Do not include presenters whose contribution consists
+only of introducing another speaker.
+
+One person must correspond to exactly one object.
+
+==================================================
+IDENTITY
+==================================================
+
+Use the transcript to determine speaker identity.
+
+Use the reference metadata to match the identity.
+
+Do not invent surnames.
+
+Do not guess an identity when there is insufficient evidence.
+
+If a speaker cannot be confidently matched to the reference data,
+do not invent metadata.
+
+==================================================
+CONTENT
+==================================================
+
+For each speaker:
+
+Aggregate ALL content belonging to that speaker.
+
+Preserve chronological order.
+
+Remove filler words.
+
+Remove transcription artifacts.
+
+Correct obvious transcription mistakes.
+
+Do not summarize.
+
+Do not paraphrase.
+
+Do not rewrite the speaker.
+
+Do not add information.
+
+Preserve technical terminology.
+
+Preserve names, companies, products, numbers and statistics.
+
+==================================================
+METADATA
+==================================================
+
+Use the reference data ONLY for:
+
+- conference
+- date
+- title
+- role
+- organization
+
+Do not invent missing metadata.
+
+Do not create speakers from reference rows that never speak.
+
+==================================================
+TOPICS
+==================================================
+
+Generate 10-20 searchable topics based ONLY
+on each speaker's actual content.
+
+Avoid generic topics.
+
+==================================================
+FINAL VALIDATION
+==================================================
+
+Before returning:
+
+- One object per real speaker.
+- No duplicate speakers.
+- No hosts.
+- No moderators.
+- No people who only appear in the reference data.
+- All content for a speaker is merged.
+- Content remains chronological.
+- No invented information.
+- Valid JSON only.
+
+REFERENCE DATA:
+
+${sheetDataString}
+
+END REFERENCE DATA.
+`
+
+  return runGeminiWithRetry(async () => {
+    const result = await model.generateContent([
+      {
+        text: prompt,
+      },
+
+      {
+        text: "CLEANED TRANSCRIPT:\n\n" + cleanedTranscript,
+      },
+    ])
+
+    const raw = result.response.text()
+
+    if (!raw) {
+      throw new Error("Gemini returned an empty speaker response.")
+    }
+
+    let parsed
+
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      console.error("Invalid speaker JSON:", raw.substring(0, 2000))
+
+      throw new Error("Gemini returned invalid JSON while extracting speakers.")
+    }
+
+    if (!Array.isArray(parsed)) {
+      throw new Error("Speaker response is not an array.")
+    }
+
+    return parsed
+  }, "Speaker extraction")
+}
+
+// --------------------------------------------------
+// CLEAN TRANSCRIPTION ENDPOINT
+// --------------------------------------------------
+
 app.post("/clean-transcription", async (req, res) => {
   console.log("Cleaning transcription request received")
 
   const { fileName, transcriptionText, sheetData } = req.body
-
-  // --------------------------------------------------
-  // VALIDATION
-  // --------------------------------------------------
 
   if (!transcriptionText) {
     return res.status(400).json({
@@ -679,349 +1182,42 @@ app.post("/clean-transcription", async (req, res) => {
   }
 
   try {
-    console.log(`Transcript length: ${transcriptionText.length} characters`)
+    // ------------------------------------------
+    // 1. SPLIT TRANSCRIPT
+    // ------------------------------------------
 
-    console.log(
-      `Metadata rows: ${
-        Array.isArray(sheetData) ? sheetData.length : "unknown"
-      }`,
-    )
+    const chunks = splitTranscript(transcriptionText)
 
-    // --------------------------------------------------
-    // RESPONSE SCHEMA
-    // --------------------------------------------------
+    console.log(`Transcript split into ${chunks.length} chunks.`)
 
-    const responseSchema = {
-      type: SchemaType.ARRAY,
+    console.log(`Original transcript: ${transcriptionText.length} chars`)
 
-      items: {
-        type: SchemaType.OBJECT,
+    // ------------------------------------------
+    // 2. CLEAN CHUNKS
+    // ------------------------------------------
 
-        properties: {
-          id: {
-            type: SchemaType.STRING,
-          },
+    const cleanedChunks = await cleanTranscriptChunks(chunks)
 
-          speaker: {
-            type: SchemaType.STRING,
-          },
+    // ------------------------------------------
+    // 3. MERGE CLEANED TRANSCRIPT
+    // ------------------------------------------
 
-          metadata: {
-            type: SchemaType.OBJECT,
+    const cleanedTranscript = cleanedChunks
+      .sort((a, b) => a.chunk - b.chunk)
+      .map((chunk) => chunk.cleaned_content)
+      .join("\n\n")
 
-            properties: {
-              conference: {
-                type: SchemaType.STRING,
-              },
+    console.log(`Cleaned transcript: ${cleanedTranscript.length} chars`)
 
-              date: {
-                type: SchemaType.STRING,
-              },
+    // ------------------------------------------
+    // 4. IDENTIFY SPEAKERS
+    // ------------------------------------------
 
-              title: {
-                type: SchemaType.STRING,
-              },
+    const finalData = await extractSpeakers(cleanedTranscript, sheetData)
 
-              role: {
-                type: SchemaType.STRING,
-              },
-
-              organization: {
-                type: SchemaType.STRING,
-              },
-
-              topics: {
-                type: SchemaType.ARRAY,
-
-                items: {
-                  type: SchemaType.STRING,
-                },
-              },
-            },
-
-            required: [
-              "conference",
-              "date",
-              "title",
-              "role",
-              "organization",
-              "topics",
-            ],
-          },
-
-          cleaned_content: {
-            type: SchemaType.STRING,
-          },
-        },
-
-        required: ["id", "speaker", "metadata", "cleaned_content"],
-      },
-    }
-
-    // --------------------------------------------------
-    // MODEL
-    // --------------------------------------------------
-
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
-
-      generationConfig: {
-        responseMimeType: "application/json",
-
-        responseSchema,
-
-        temperature: 0,
-      },
-    })
-
-    // --------------------------------------------------
-    // METADATA
-    // --------------------------------------------------
-
-    const sheetDataString = JSON.stringify(sheetData, null, 2)
-
-    // --------------------------------------------------
-    // PROMPT
-    // --------------------------------------------------
-
-    const prompt = `
-You are processing a transcript of a conference talk.
-
-Your task is to identify the REAL SPEAKERS who actually speak
-in the transcript, clean their spoken content, and match each
-speaker with metadata from the provided reference data.
-
-Follow the steps EXACTLY in this order.
-
-==================================================
-STEP 1 — IDENTIFY REAL SPEAKERS
-==================================================
-
-Determine how many DISTINCT PEOPLE actually speak in the transcript.
-
-IMPORTANT:
-
-- Identify speakers ONLY from the transcript.
-- Do NOT use the spreadsheet/reference data to decide who speaks.
-- The reference data is ONLY for metadata matching.
-- Only include people who actually have spoken content.
-- Do NOT include people who are merely mentioned.
-- Do NOT include people who are thanked but never speak.
-- Do NOT include audience members who do not have meaningful spoken turns.
-- Do NOT create one object per spreadsheet row.
-- Do NOT create duplicate objects for the same speaker.
-- One person = one object.
-
-HOST / MODERATOR:
-
-- Do NOT include hosts.
-- Do NOT include moderators.
-- Do NOT include interviewers.
-- Do NOT include presenters whose only role is introducing another speaker.
-- If someone acts as both host and speaker, determine from their actual
-  contribution whether they are a real speaker for the talk.
-- Do not create an object named "Host", "Moderator", "Interviewer",
-  "Presenter" or "Unknown".
-
-If a person's name cannot be determined reliably from the transcript,
-do NOT invent a name.
-
-==================================================
-STEP 2 — CLEAN EACH SPEAKER'S CONTENT
-==================================================
-
-For each real speaker:
-
-- Remove filler words such as:
-  "um", "uh", "erm", "you know", etc.
-- Remove obvious transcription artifacts.
-- Remove duplicated words caused by transcription errors.
-- Correct obvious spelling errors.
-- Correct obvious transcription mistakes when the intended word
-  is unambiguous.
-- Correct obvious split words.
-- Preserve technical terminology.
-- Preserve product names.
-- Preserve company names.
-- Preserve numbers and statistics.
-- Preserve the speaker's meaning.
-- Preserve the speaker's original wording as much as possible.
-
-DO NOT:
-
-- Rewrite the speaker.
-- Paraphrase.
-- Summarize.
-- Improve their arguments.
-- Make the language more professional.
-- Add information.
-- Remove meaningful repetitions that are intentionally spoken.
-
-The result should read like a clean transcript of what the speaker
-actually said.
-
-==================================================
-STEP 3 — AGGREGATE EACH SPEAKER
-==================================================
-
-A speaker may appear many times throughout the transcript.
-
-Merge ALL of that speaker's spoken segments into ONE
-"cleaned_content" string.
-
-The content MUST remain chronological.
-
-Example:
-
-Speaker A:
-[first section]
-[later section]
-[final section]
-
-All three sections must become one cleaned_content.
-
-Do NOT create:
-
-Speaker A #1
-Speaker A #2
-Speaker A #3
-
-There must be exactly ONE object for Speaker A.
-
-==================================================
-STEP 4 — MATCH METADATA
-==================================================
-
-Use the reference data below ONLY to match metadata.
-
-Match speakers by name similarity.
-
-The transcript is the source of truth for:
-- Who actually speaks.
-- How many speakers exist.
-- What each person actually said.
-
-The reference data is the source of truth for:
-- conference
-- date
-- title
-- role
-- organization
-
-DO NOT:
-
-- Add people because they exist in the reference data.
-- Assume that every person in the reference data speaks.
-- Invent missing metadata.
-- Guess a person's identity when the match is uncertain.
-
-If a speaker cannot be matched confidently to the reference data,
-keep the speaker but leave unmatched metadata fields empty.
-
-==================================================
-STEP 5 — TOPICS
-==================================================
-
-Generate 10-20 highly relevant and searchable topic tags
-for each speaker.
-
-Topics MUST be based ONLY on that speaker's actual content.
-
-Good topics are things such as:
-
-- API design
-- API security
-- developer experience
-- microservices
-- observability
-- distributed systems
-
-Do NOT generate generic topics such as:
-
-- conference
-- technology
-- software
-- programming
-
-unless they are genuinely relevant.
-
-==================================================
-STEP 6 — FINAL VALIDATION
-==================================================
-
-Before returning the result:
-
-- Every object must represent a person who actually speaks.
-- No hosts.
-- No moderators.
-- No people who are merely mentioned.
-- No duplicate speakers.
-- All content belonging to the same speaker must be merged.
-- Preserve chronological order within cleaned_content.
-- Do not invent content.
-- Do not invent names.
-- Do not invent metadata.
-- Return ONLY valid JSON matching the requested schema.
-
-REFERENCE DATA
-==============
-
-${sheetDataString}
-
-END REFERENCE DATA
-`
-
-    // --------------------------------------------------
-    // GEMINI REQUEST
-    // --------------------------------------------------
-
-    console.log("Sending transcript to Gemini for cleaning...")
-
-    const result = await model.generateContent([
-      {
-        text: prompt,
-      },
-
-      {
-        text: "TRANSCRIPT TO CLEAN:\n\n" + transcriptionText,
-      },
-    ])
-
-    // --------------------------------------------------
-    // PARSE RESULT
-    // --------------------------------------------------
-
-    const rawResult = result.response.text()
-
-    if (!rawResult) {
-      throw new Error("Gemini returned an empty response.")
-    }
-
-    console.log("Gemini cleaning completed.")
-
-    let finalData
-
-    try {
-      finalData = JSON.parse(rawResult)
-    } catch (parseError) {
-      console.error("Failed to parse Gemini JSON:", rawResult)
-
-      throw new Error("Gemini returned invalid JSON.")
-    }
-
-    // --------------------------------------------------
-    // SAFETY VALIDATION
-    // --------------------------------------------------
-
-    if (!Array.isArray(finalData)) {
-      throw new Error("Gemini response is not an array.")
-    }
-
-    // --------------------------------------------------
-    // DEDUPLICATE SPEAKERS
-    // --------------------------------------------------
-
-    const originalCount = finalData.length
+    // ------------------------------------------
+    // 5. SAFETY DEDUPE
+    // ------------------------------------------
 
     const mergedBySpeaker = new Map()
 
@@ -1037,68 +1233,22 @@ END REFERENCE DATA
         continue
       }
 
-      // ----------------------------------------------
-      // Ignore obvious host/moderator entries
-      // ----------------------------------------------
-
-      const normalizedSpeaker = speaker
-        .toLowerCase()
-        .replace(/\s+/g, " ")
-        .trim()
+      const key = speaker.toLowerCase().replace(/\s+/g, " ")
 
       if (
-        normalizedSpeaker === "host" ||
-        normalizedSpeaker === "moderator" ||
-        normalizedSpeaker === "interviewer" ||
-        normalizedSpeaker === "presenter" ||
-        normalizedSpeaker === "unknown"
+        key === "host" ||
+        key === "moderator" ||
+        key === "interviewer" ||
+        key === "presenter" ||
+        key === "unknown"
       ) {
-        console.warn(`Skipping non-speaker entry: ${speaker}`)
-
         continue
       }
 
-      // ----------------------------------------------
-      // Speaker matching key
-      // ----------------------------------------------
-
-      const key = normalizedSpeaker
-
-      // ----------------------------------------------
-      // Normalize metadata
-      // ----------------------------------------------
-
-      const metadata = entry.metadata || {}
-
-      const normalizedMetadata = {
-        conference: metadata.conference || "",
-
-        date: metadata.date || "",
-
-        title: metadata.title || "",
-
-        role: metadata.role || "",
-
-        organization: metadata.organization || "",
-
-        topics: Array.isArray(metadata.topics) ? metadata.topics : [],
-      }
-
-      // ----------------------------------------------
-      // Content
-      // ----------------------------------------------
-
-      const content =
-        typeof entry.cleaned_content === "string"
-          ? entry.cleaned_content.trim()
-          : ""
-
-      // ----------------------------------------------
-      // MERGE DUPLICATES
-      // ----------------------------------------------
-
       if (mergedBySpeaker.has(key)) {
         const existing = mergedBySpeaker.get(key)
+
+        const content = entry.cleaned_content || ""
 
         if (content) {
           existing.cleaned_content =
@@ -1107,65 +1257,52 @@ END REFERENCE DATA
 
         existing.metadata.topics = [
           ...new Set([
-            ...(existing.metadata.topics || []),
-            ...normalizedMetadata.topics,
+            ...(existing.metadata?.topics || []),
+
+            ...(entry.metadata?.topics || []),
           ]),
         ]
-
-        // Fill missing metadata
-        // without overwriting existing
-        // values with empty values.
-
-        for (const field of [
-          "conference",
-          "date",
-          "title",
-          "role",
-          "organization",
-        ]) {
-          if (!existing.metadata[field] && normalizedMetadata[field]) {
-            existing.metadata[field] = normalizedMetadata[field]
-          }
-        }
       } else {
         mergedBySpeaker.set(key, {
           id: entry.id || crypto.randomUUID(),
 
           speaker,
 
-          metadata: normalizedMetadata,
+          metadata: {
+            conference: entry.metadata?.conference || "",
 
-          cleaned_content: content,
+            date: entry.metadata?.date || "",
+
+            title: entry.metadata?.title || "",
+
+            role: entry.metadata?.role || "",
+
+            organization: entry.metadata?.organization || "",
+
+            topics: entry.metadata?.topics || [],
+          },
+
+          cleaned_content: entry.cleaned_content || "",
         })
       }
     }
 
-    finalData = Array.from(mergedBySpeaker.values())
+    const resultData = Array.from(mergedBySpeaker.values())
 
-    // --------------------------------------------------
-    // LOGGING
-    // --------------------------------------------------
+    console.log(`Final speakers: ${resultData.length}`)
 
-    if (finalData.length !== originalCount) {
-      console.warn(
-        `⚠️ Speaker dedupe: Gemini returned ${originalCount} objects, merged to ${finalData.length}.`,
-      )
-    }
-
-    console.log(`Final speakers: ${finalData.length}`)
-
-    // --------------------------------------------------
-    // RESPONSE
-    // --------------------------------------------------
+    // ------------------------------------------
+    // 6. RESPONSE
+    // ------------------------------------------
 
     return res.json({
       success: true,
 
       fileName: `cleaned_transcription_${fileName || "transcription"}.json`,
 
-      speakers: finalData.length,
+      speakers: resultData.length,
 
-      data: finalData,
+      data: resultData,
     })
   } catch (error) {
     console.error("Error during the cleaning process:")
