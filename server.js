@@ -46,15 +46,32 @@ const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY)
 // TRANSCRIPTION CONFIG
 // --------------------------------------------------
 
-// Cada chunk tendrá 15 minutos.
+// Duración aproximada de cada chunk.
 // 9 horas ≈ 36 chunks.
 const CHUNK_DURATION = 15 * 60
 
-// Número de transcripciones simultáneas.
+// Número de chunks procesados simultáneamente.
 const MAX_CONCURRENCY = 3
 
-// Número de intentos por chunk.
+// Intentos normales.
 const MAX_RETRIES = 3
+
+// --------------------------------------------------
+// SILENCE CONFIG
+// --------------------------------------------------
+
+// Silencios de esta duración o mayores serán
+// eliminados/reducidos durante el preprocesamiento.
+//
+// 2.5 segundos permite conservar pausas naturales
+// mientras elimina silencios largos.
+const SILENCE_DURATION = 2.5
+
+// Nivel de silencio.
+// -35dB funciona razonablemente bien para conferencias.
+// Si el audio tiene mucho ruido de fondo podemos
+// bajarlo a -30dB.
+const SILENCE_THRESHOLD = "-35dB"
 
 // --------------------------------------------------
 // UTILS
@@ -82,13 +99,12 @@ function removeDirectory(directory) {
 }
 
 // --------------------------------------------------
-// SPLIT AUDIO
+// DETECT / REMOVE LONG SILENCES
 // --------------------------------------------------
 
-async function splitAudio(inputPath, outputDirectory) {
-  ensureDirectory(outputDirectory)
-
-  console.log("Dividiendo audio con FFmpeg...")
+async function cleanAudio(inputPath, outputPath) {
+  console.log("")
+  console.log("Limpiando silencios largos con FFmpeg...")
 
   await execFileAsync("ffmpeg", [
     "-hide_banner",
@@ -98,6 +114,10 @@ async function splitAudio(inputPath, outputDirectory) {
     "-i",
     inputPath,
 
+    // ------------------------------------------
+    // AUDIO FORMAT
+    // ------------------------------------------
+
     // Mono
     "-ac",
     "1",
@@ -106,14 +126,86 @@ async function splitAudio(inputPath, outputDirectory) {
     "-ar",
     "16000",
 
-    // MP3 optimizado para voz
+    // ------------------------------------------
+    // SILENCE REMOVAL
+    // ------------------------------------------
+
+    "-af",
+    [
+      "silenceremove=",
+
+      // Buscar silencios durante todo el audio.
+      "start_periods=1",
+
+      // No eliminar silencios del principio
+      // agresivamente.
+      "start_duration=0.3",
+
+      `start_threshold=${SILENCE_THRESHOLD}`,
+
+      // Eliminar silencios que aparecen
+      // durante el resto del audio.
+      "stop_periods=-1",
+
+      `stop_duration=${SILENCE_DURATION}`,
+
+      `stop_threshold=${SILENCE_THRESHOLD}`,
+
+      // Mantener 0.4 segundos de silencio
+      // como separación natural.
+      "stop_silence=0.4",
+    ].join(""),
+
+    // ------------------------------------------
+    // OUTPUT
+    // ------------------------------------------
+
     "-c:a",
     "libmp3lame",
 
     "-b:a",
     "64k",
 
-    // Crear segmentos
+    "-y",
+
+    outputPath,
+  ])
+
+  console.log("Audio limpio generado:", outputPath)
+
+  return outputPath
+}
+
+// --------------------------------------------------
+// SPLIT AUDIO
+// --------------------------------------------------
+
+async function splitAudio(inputPath, outputDirectory) {
+  ensureDirectory(outputDirectory)
+
+  console.log("")
+  console.log("Dividiendo audio limpio con FFmpeg...")
+
+  const cleanedAudioPath = path.join(outputDirectory, "audio_cleaned.mp3")
+
+  // ------------------------------------------
+  // 1. REMOVE LONG SILENCES
+  // ------------------------------------------
+
+  await cleanAudio(inputPath, cleanedAudioPath)
+
+  // ------------------------------------------
+  // 2. SPLIT INTO CHUNKS
+  // ------------------------------------------
+
+  await execFileAsync("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+
+    "-i",
+    cleanedAudioPath,
+
     "-f",
     "segment",
 
@@ -123,16 +215,22 @@ async function splitAudio(inputPath, outputDirectory) {
     "-segment_start_number",
     "0",
 
+    "-c",
+    "copy",
+
     path.join(outputDirectory, "chunk_%03d.mp3"),
   ])
 
   const chunks = fs
     .readdirSync(outputDirectory)
-    .filter((file) => file.endsWith(".mp3"))
+    .filter((file) => file.startsWith("chunk_") && file.endsWith(".mp3"))
     .sort()
     .map((file) => path.join(outputDirectory, file))
 
+  console.log("")
   console.log(`Audio dividido en ${chunks.length} chunks.`)
+
+  console.log(`Duración aproximada por chunk: ${CHUNK_DURATION / 60} minutos.`)
 
   return chunks
 }
@@ -168,6 +266,68 @@ async function uploadToGemini(filePath, chunkNumber) {
 }
 
 // --------------------------------------------------
+// REPETITION DETECTION
+// --------------------------------------------------
+
+function detectSuspiciousRepetition(text) {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  if (!normalized) {
+    return false
+  }
+
+  const words = normalized.split(" ").filter(Boolean)
+
+  // Textos pequeños no deberían
+  // considerarse sospechosos.
+  if (words.length < 40) {
+    return false
+  }
+
+  // ------------------------------------------
+  // 1. PALABRA DOMINANTE
+  // ------------------------------------------
+
+  const counts = {}
+
+  for (const word of words) {
+    counts[word] = (counts[word] || 0) + 1
+  }
+
+  const maxCount = Math.max(...Object.values(counts))
+
+  const dominantRatio = maxCount / words.length
+
+  if (dominantRatio > 0.3) {
+    return true
+  }
+
+  // ------------------------------------------
+  // 2. FRASES REPETIDAS
+  // ------------------------------------------
+
+  const phrases = {}
+
+  for (let i = 0; i < words.length - 3; i++) {
+    const phrase = words.slice(i, i + 4).join(" ")
+
+    phrases[phrase] = (phrases[phrase] || 0) + 1
+  }
+
+  const maxPhraseCount = Math.max(...Object.values(phrases))
+
+  if (maxPhraseCount >= 8) {
+    return true
+  }
+
+  return false
+}
+
+// --------------------------------------------------
 // TRANSCRIBE ONE CHUNK
 // --------------------------------------------------
 
@@ -176,7 +336,10 @@ async function transcribeChunk(filePath, chunkNumber) {
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
+      console.log("")
       console.log(`[Chunk ${chunkNumber}] Transcribiendo...`)
+
+      console.log(`[Chunk ${chunkNumber}] Intento ${attempt}/${MAX_RETRIES}`)
 
       const file = await uploadToGemini(filePath, chunkNumber)
 
@@ -184,33 +347,57 @@ async function transcribeChunk(filePath, chunkNumber) {
         model: "gemini-2.5-flash",
       })
 
+      // ------------------------------------------
+      // PROMPT
+      // ------------------------------------------
+
       const prompt = `
 You are a professional conference transcription system.
 
-This audio is ONE SEGMENT of a longer conference recording.
+You are processing ONE SEGMENT of a longer conference recording.
 
-Transcribe ALL spoken content contained in this audio segment.
+Your ONLY task is to transcribe actual human speech contained in this audio.
 
-Rules:
+CRITICAL ANTI-HALLUCINATION RULES:
 
-- Preserve the chronological order.
-- Do not summarize.
-- Do not omit meaningful spoken content.
+- Only transcribe speech that is actually audible.
+- If there is silence, output nothing.
+- If there is background noise, do not turn it into words.
+- If there is microphone noise, do not turn it into words.
+- If speech is genuinely unintelligible, do not invent words.
+- NEVER repeat a word, phrase or sentence simply because the audio contains silence or noise.
+- NEVER generate text to fill empty parts of the audio.
+- NEVER loop or repeat the same sentence.
+- NEVER summarize.
+- NEVER describe what is happening in the audio.
+- NEVER add commentary.
+
+TRANSCRIPTION RULES:
+
+- Preserve chronological order.
+- Transcribe all meaningful human speech.
 - Preserve technical terminology.
-- Preserve names, numbers, statistics and product names accurately.
-- Remove obvious verbal fillers and stutters when they do not add meaning.
-- Do not invent information.
-- Do not reconstruct missing words or sentences.
+- Preserve names, numbers, statistics and product names.
+- Remove obvious verbal fillers such as "um", "uh", "you know", etc. when they do not add meaning.
+- Remove obvious stuttering when the intended phrase is clear.
+- Do not remove meaningful words.
+- Do not invent missing words.
+- Do not reconstruct sentences that cannot be understood.
 - Do not repeat content.
-- Do not describe the audio.
-- Do not provide commentary.
-- Do not provide a summary.
-- Return only the transcription.
+- Return ONLY the transcription.
+- Return plain text.
 
-This is only one segment of a larger recording.
-Do not assume this is the beginning or the end of the conference.
+IMPORTANT:
 
-Return the clean transcription as plain text.
+This audio segment may contain long periods of silence.
+
+If you encounter silence or non-speech audio:
+DO NOT WRITE ANYTHING FOR THAT PART.
+
+If the entire segment contains no understandable speech,
+return an empty response.
+
+Do not assume this is the beginning or end of the conference.
 `
 
       const result = await model.generateContent({
@@ -239,29 +426,69 @@ Return the clean transcription as plain text.
         },
       })
 
-      const transcription = result.response.text()
+      const transcription = result.response.text().trim()
+
+      // ------------------------------------------
+      // EMPTY TRANSCRIPTION
+      // ------------------------------------------
 
       if (!transcription) {
-        throw new Error("Gemini devolvió una transcripción vacía.")
+        console.log(`[Chunk ${chunkNumber}] Sin habla detectable.`)
+
+        return {
+          chunk: chunkNumber,
+          transcription: "",
+        }
+      }
+
+      // ------------------------------------------
+      // CHECK REPETITION
+      // ------------------------------------------
+
+      const suspicious = detectSuspiciousRepetition(transcription)
+
+      if (suspicious) {
+        console.warn("")
+        console.warn(
+          `⚠️ [Chunk ${chunkNumber}] Posible repetición/alucinación detectada.`,
+        )
+
+        console.warn(`Longitud: ${transcription.length} caracteres`)
+
+        // No aceptamos el resultado.
+        throw new Error(
+          "Gemini produjo una transcripción sospechosamente repetitiva.",
+        )
       }
 
       console.log(`[Chunk ${chunkNumber}] Transcripción completada.`)
 
+      console.log(`[Chunk ${chunkNumber}] Caracteres: ${transcription.length}`)
+
       return {
         chunk: chunkNumber,
-        transcription: transcription.trim(),
+        transcription,
       }
     } catch (error) {
       lastError = error
 
-      console.error(
-        `[Chunk ${chunkNumber}] Error. Intento ${attempt}/${MAX_RETRIES}`,
-      )
+      console.error("")
+      console.error(`[Chunk ${chunkNumber}] Error.`)
+
+      console.error(`Intento ${attempt}/${MAX_RETRIES}`)
 
       console.error(error.message)
 
       if (attempt < MAX_RETRIES) {
-        await sleep(5000 * attempt)
+        const waitTime = 5000 * attempt
+
+        console.log(
+          `[Chunk ${chunkNumber}] Reintentando en ${
+            waitTime / 1000
+          } segundos...`,
+        )
+
+        await sleep(waitTime)
       }
     }
   }
@@ -270,7 +497,7 @@ Return the clean transcription as plain text.
 }
 
 // --------------------------------------------------
-// PROCESS CHUNKS WITH CONCURRENCY
+// PROCESS CHUNKS
 // --------------------------------------------------
 
 async function processChunks(chunks) {
@@ -286,6 +513,7 @@ async function processChunks(chunks) {
         return
       }
 
+      console.log("")
       console.log(`[Worker ${workerId}] Procesando chunk ${index}`)
 
       results[index] = await transcribeChunk(chunks[index], index)
@@ -312,6 +540,7 @@ function mergeTranscriptions(results) {
   return results
     .sort((a, b) => a.chunk - b.chunk)
     .map((result) => result.transcription)
+    .filter(Boolean)
     .join("\n\n")
 }
 
@@ -355,7 +584,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     console.log("")
 
     // ------------------------------------------
-    // 1. SPLIT AUDIO
+    // 1. CLEAN + SPLIT AUDIO
     // ------------------------------------------
 
     const chunks = await splitAudio(localFilePath, processingDirectory)
@@ -388,6 +617,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     console.log("TRANSCRIPCIÓN COMPLETADA")
     console.log("========================================")
     console.log(`Chunks: ${chunks.length}`)
+    console.log(`Caracteres: ${transcription.length}`)
     console.log(`Archivo: ${outputFile}`)
     console.log("========================================")
     console.log("")
@@ -439,8 +669,9 @@ app.post("/transcribe", upload.any(), async (req, res) => {
       jobId,
     })
   } finally {
-    // Limpiar chunks temporales
-    // después de terminar.
+    // ------------------------------------------
+    // CLEAN TEMPORARY FILES
+    // ------------------------------------------
 
     if (processingDirectory) {
       removeDirectory(processingDirectory)
