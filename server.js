@@ -106,18 +106,11 @@ async function cleanAudio(inputPath, outputPath) {
   console.log("")
   console.log("Limpiando silencios largos con FFmpeg...")
 
-  const silenceFilter = [
-    "silenceremove",
-    "start_periods=1",
-    "start_duration=0.3",
-    `start_threshold=${SILENCE_THRESHOLD}`,
-    "stop_periods=-1",
-    `stop_duration=${SILENCE_DURATION}`,
-    `stop_threshold=${SILENCE_THRESHOLD}`,
-    "stop_silence=0.4",
-  ].join(":")
+  const silenceFilter =
+    "silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB:stop_periods=-1:stop_duration=2.5:stop_threshold=-35dB:stop_silence=0.4"
 
-  console.log("FFmpeg filter:", silenceFilter)
+  console.log("FFmpeg filter:")
+  console.log(silenceFilter)
 
   await execFileAsync("ffmpeg", [
     "-hide_banner",
@@ -127,21 +120,18 @@ async function cleanAudio(inputPath, outputPath) {
     "-i",
     inputPath,
 
-    // Mono
     "-ac",
     "1",
 
-    // 16 kHz
     "-ar",
     "16000",
 
-    // Eliminar silencios largos
     "-af",
     silenceFilter,
 
-    // MP3 optimizado para voz
     "-c:a",
     "libmp3lame",
+
     "-b:a",
     "64k",
 
@@ -154,7 +144,6 @@ async function cleanAudio(inputPath, outputPath) {
 
   return outputPath
 }
-
 // --------------------------------------------------
 // SPLIT AUDIO
 // --------------------------------------------------
