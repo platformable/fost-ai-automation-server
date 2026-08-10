@@ -58,7 +58,7 @@ const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY)
 
 // Duración aproximada de cada chunk.
 // 9 horas ≈ 36 chunks.
-const CHUNK_DURATION = 15 * 60
+const CHUNK_DURATION = 5 * 60
 
 // Número de chunks procesados simultáneamente.
 const MAX_CONCURRENCY = 3
@@ -314,47 +314,85 @@ async function uploadToGemini(filePath, chunkNumber) {
 // --------------------------------------------------
 
 function detectSuspiciousRepetition(text) {
+  if (!text) {
+    return false
+  }
+
   const normalized = text
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim()
 
-  if (!normalized) {
-    return false
-  }
-
   const words = normalized.split(" ").filter(Boolean)
 
-  if (words.length < 80) {
+  // Una transcripción de 5 minutos debería
+  // tener bastantes palabras, pero no queremos
+  // analizar textos pequeños.
+  if (words.length < 100) {
     return false
   }
 
-  // ------------------------------------------
-  // Detectar frases consecutivas repetidas
-  // ------------------------------------------
+  // ------------------------------------------------
+  // 1. Detectar una frase de 5 palabras repetida
+  // muchas veces dentro del texto.
+  // ------------------------------------------------
 
-  const phraseSize = 6
+  const N = 5
 
-  let consecutiveRepeats = 0
+  const occurrences = new Map()
 
-  for (let i = 0; i < words.length - phraseSize * 3; i++) {
-    const phrase = words.slice(i, i + phraseSize).join(" ")
+  for (let i = 0; i <= words.length - N; i++) {
+    const phrase = words.slice(i, i + N).join(" ")
 
-    const nextPhrase = words.slice(i + phraseSize, i + phraseSize * 2).join(" ")
+    const positions = occurrences.get(phrase) || []
 
-    const thirdPhrase = words
-      .slice(i + phraseSize * 2, i + phraseSize * 3)
-      .join(" ")
+    positions.push(i)
 
-    if (phrase === nextPhrase && phrase === thirdPhrase) {
-      consecutiveRepeats++
+    occurrences.set(phrase, positions)
+  }
 
-      if (consecutiveRepeats >= 2) {
-        return true
-      }
-    } else {
-      consecutiveRepeats = 0
+  for (const [phrase, positions] of occurrences) {
+    if (positions.length < 15) {
+      continue
+    }
+
+    // Comprobar si las apariciones están
+    // muy concentradas.
+    const first = positions[0]
+    const last = positions[positions.length - 1]
+
+    const span = last - first
+
+    // Si una misma frase aparece 15+ veces
+    // en menos de 2000 palabras, es extremadamente
+    // sospechoso.
+    if (positions.length >= 15 && span < 2000) {
+      console.warn(
+        `⚠️ Repetición sospechosa detectada: "${phrase}" (${positions.length} veces)`,
+      )
+
+      return true
+    }
+  }
+
+  // ------------------------------------------------
+  // 2. Detectar bloques repetidos
+  // ------------------------------------------------
+
+  const BLOCK_SIZE = 10
+
+  for (let i = 0; i < words.length - BLOCK_SIZE * 3; i++) {
+    const block1 = words.slice(i, i + BLOCK_SIZE).join(" ")
+
+    const block2 = words.slice(i + BLOCK_SIZE, i + BLOCK_SIZE * 2).join(" ")
+
+    const block3 = words.slice(i + BLOCK_SIZE * 2, i + BLOCK_SIZE * 3).join(" ")
+
+    if (block1 === block2 && block2 === block3) {
+      console.warn("⚠️ Bloque de texto repetido 3 veces consecutivas.")
+
+      return true
     }
   }
 
@@ -393,115 +431,71 @@ async function transcribeChunk(filePath, chunkNumber) {
 
       if (attempt === 1) {
         prompt = `
-You are a professional conference transcription system.
+Generate a faithful transcript of the speech
+actually present in this audio segment.
 
-You are processing ONE SEGMENT of a longer conference recording.
-
-Your task is to create a faithful textual record of the
-human speech that is actually audible in this audio.
+Process the audio strictly once, from beginning
+to end.
 
 IMPORTANT:
+Never repeat a phrase, sentence, paragraph or
+section that you have already transcribed.
 
-The audio provided in this request is the ONLY source of truth.
+Do not continue generating text after the audio
+content has ended.
 
-Only transcribe speech that you can actually hear in the audio.
+Do not infer or invent speech.
 
-Rules:
+Use ONLY the audio supplied in this request.
 
-- Preserve chronological order.
-- Transcribe all meaningful spoken content.
-- Do not summarize.
-- Do not paraphrase.
-- Do not invent information.
-- Do not add information from your general knowledge.
-- Do not reconstruct missing speech.
-- Preserve technical terminology.
-- Preserve names, companies, products and numbers.
-- Preserve the speaker's actual meaning and wording.
-- Remove obvious verbal fillers such as "um", "uh", "erm"
-  when they do not add meaning.
-- Remove obvious transcription artifacts.
-- Remove accidental stuttering when the intended phrase is clear.
-- Do not remove meaningful repetition.
-- Do not describe the audio.
-- Do not provide commentary.
-- Do not provide a summary.
-
-IMPORTANT ANTI-HALLUCINATION RULE:
-
-If a portion contains silence, background noise, microphone noise,
-room ambience, applause, or unintelligible audio, do not invent speech.
-
-Never generate words simply because you expect someone to be speaking.
-
-If there is no understandable speech, output nothing for that portion.
-
-Return ONLY the transcription as plain text.
+Return ONLY the transcript.
 `
       } else if (attempt === 2) {
         prompt = `
-Create a faithful textual record of the spoken content
-contained in the supplied audio segment.
+Transcribe ONLY the human speech that is actually
+audible in this audio segment.
 
-Use ONLY the audio in this request.
+Process the audio sequentially from start to finish.
 
-The objective is to accurately capture what is actually audible,
-in chronological order.
+Each spoken passage must appear exactly once.
 
-Rules:
+IMPORTANT:
+If you notice that you are generating the same
+sentence or phrase repeatedly, STOP and continue
+with the next part of the audio.
 
-- Transcribe actual human speech.
-- Preserve substantive spoken information.
-- Preserve names, technical terms, companies, products,
-  numbers and statistics.
-- Preserve the speaker's meaning.
-- Remove obvious filler sounds such as "um", "uh" and "erm".
-- Remove obvious stutters and transcription artifacts.
-- Do not summarize.
-- Do not paraphrase.
-- Do not invent.
-- Do not use outside knowledge.
-- Do not complete missing sentences from context.
-- Do not add information that is not audible.
-- Do not repeat content.
-- Do not generate text during silence or background noise.
+Never loop.
 
-Use only the supplied audio as your source.
+Never repeat previously transcribed content.
 
-Return ONLY the resulting transcription.
+Do not use outside knowledge.
+
+Do not invent missing words.
+
+Return ONLY the transcript.
 `
       } else {
         prompt = `
-Transcribe the human speech that is actually audible
-in this audio segment.
+Produce a clean chronological transcription of
+this audio segment.
 
-This is a segment of a conference recording.
+Use only the supplied audio.
 
-Use ONLY the supplied audio.
-
-Capture the spoken information faithfully and chronologically.
+This is one segment of a larger conference.
 
 Do not summarize.
-Do not explain.
-Do not add information.
-Do not use outside knowledge.
-Do not invent missing words.
-Do not reconstruct unclear speech.
-Do not repeat sentences.
 
-Remove only obvious filler sounds and accidental stuttering.
+Do not repeat.
 
-Preserve:
+Do not hallucinate.
 
-- technical terminology
-- names
-- companies
-- products
-- numbers
-- statistics
-- meaningful wording
+Do not reconstruct speech that is not audible.
 
-Ignore silence, room noise, microphone noise and unintelligible audio.
+Every part of the spoken audio must be represented
+at most once.
+
+If the audio contains silence or unintelligible
+content, omit it.
 
 Return ONLY the transcription.
 `
@@ -621,32 +615,15 @@ Return ONLY the transcription.
       const suspicious = detectSuspiciousRepetition(transcription)
 
       if (suspicious) {
-        console.warn("")
-        console.warn(`⚠️ [Chunk ${chunkNumber}] Posible repetición detectada.`)
-
         console.warn(
-          `[Chunk ${chunkNumber}] Longitud: ${transcription.length} caracteres`,
+          `[Chunk ${chunkNumber}] Gemini produjo una transcripción sospechosamente repetitiva.`,
         )
 
-        // IMPORTANTE:
-        // NO lanzamos error.
-        //
-        // El detector es solamente una señal.
-        // No queremos descartar una transcripción
-        // legítima de 100k+ caracteres.
+        throw new Error("GEMINI_REPETITIVE_OUTPUT")
       }
-
-      // ------------------------------------------
-      // SUCCESS
-      // ------------------------------------------
-
-      console.log(`[Chunk ${chunkNumber}] Transcripción completada.`)
-
-      console.log(`[Chunk ${chunkNumber}] Caracteres: ${transcription.length}`)
 
       return {
         chunk: chunkNumber,
-
         transcription,
       }
     } catch (error) {
@@ -665,7 +642,11 @@ Return ONLY the transcription.
 
       if (attempt < MAX_RETRIES) {
         const waitTime =
-          error.message === "GEMINI_RECITATION" ? 3000 : 5000 * attempt
+          error.message === "GEMINI_RECITATION"
+            ? 3000
+            : error.message === "GEMINI_REPETITIVE_OUTPUT"
+              ? 3000
+              : 5000 * attempt
 
         console.log(
           `[Chunk ${chunkNumber}] Reintentando en ${
@@ -841,6 +822,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     console.error("========================================")
     console.error(error)
     console.error("========================================")
+    console.error(`[Chunk ${chunkNumber}] Error type:`, error.message)
 
     if (localFilePath && fs.existsSync(localFilePath)) {
       try {
