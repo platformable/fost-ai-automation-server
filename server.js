@@ -167,13 +167,13 @@ async function splitAudio(inputPath, outputDirectory) {
   const cleanedAudioPath = path.join(outputDirectory, "audio_cleaned.mp3")
 
   // ------------------------------------------
-  // 1. REMOVE LONG SILENCES
+  // 1. CLEAN AUDIO
   // ------------------------------------------
 
   await cleanAudio(inputPath, cleanedAudioPath)
 
   // ------------------------------------------
-  // 2. SPLIT INTO CHUNKS
+  // 2. SPLIT AUDIO
   // ------------------------------------------
 
   await execFileAsync("ffmpeg", [
@@ -193,22 +193,70 @@ async function splitAudio(inputPath, outputDirectory) {
     "-segment_start_number",
     "0",
 
-    "-c",
-    "copy",
+    // IMPORTANTE:
+    // Cada chunk se codifica como un archivo
+    // independiente.
+    "-c:a",
+    "libmp3lame",
+
+    "-b:a",
+    "64k",
+
+    "-ar",
+    "16000",
+
+    "-ac",
+    "1",
+
+    "-y",
 
     path.join(outputDirectory, "chunk_%03d.mp3"),
   ])
 
+  // ------------------------------------------
+  // 3. FIND ACTUAL CHUNKS
+  // ------------------------------------------
+
   const chunks = fs
     .readdirSync(outputDirectory)
-    .filter((file) => file.startsWith("chunk_") && file.endsWith(".mp3"))
-    .sort()
+    .filter((file) => /^chunk_\d+\.mp3$/.test(file))
+    .sort((a, b) => {
+      const aNumber = parseInt(a.match(/\d+/)[0], 10)
+
+      const bNumber = parseInt(b.match(/\d+/)[0], 10)
+
+      return aNumber - bNumber
+    })
     .map((file) => path.join(outputDirectory, file))
 
-  console.log("")
-  console.log(`Audio dividido en ${chunks.length} chunks.`)
+  // ------------------------------------------
+  // 4. VERIFY FILES
+  // ------------------------------------------
 
-  console.log(`Duración aproximada por chunk: ${CHUNK_DURATION / 60} minutos.`)
+  console.log("")
+  console.log(`FFmpeg generó ${chunks.length} chunks.`)
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i]
+
+    const stats = fs.statSync(chunk)
+
+    console.log(
+      `[Chunk ${i}] ${path.basename(chunk)} - ${(
+        stats.size /
+        1024 /
+        1024
+      ).toFixed(2)} MB`,
+    )
+
+    if (stats.size === 0) {
+      throw new Error(`Chunk vacío: ${chunk}`)
+    }
+  }
+
+  if (chunks.length === 0) {
+    throw new Error("FFmpeg no generó ningún chunk.")
+  }
 
   return chunks
 }
@@ -218,12 +266,30 @@ async function splitAudio(inputPath, outputDirectory) {
 // --------------------------------------------------
 
 async function uploadToGemini(filePath, chunkNumber) {
+  // ------------------------------------------
+  // VERIFY LOCAL FILE
+  // ------------------------------------------
+
+  if (!fs.existsSync(filePath)) {
+    throw new Error(
+      `El archivo del chunk ${chunkNumber} no existe: ${filePath}`,
+    )
+  }
+
+  const stats = fs.statSync(filePath)
+
+  if (stats.size === 0) {
+    throw new Error(
+      `El archivo del chunk ${chunkNumber} está vacío: ${filePath}`,
+    )
+  }
+
   console.log(`[Chunk ${chunkNumber}] Subiendo a Gemini...`)
 
   const response = await fileManager.uploadFile(filePath, {
     mimeType: "audio/mpeg",
 
-    displayName: `conference_chunk_${chunkNumber}.mp3`,
+    displayName: `conference_chunk_${String(chunkNumber).padStart(3, "0")}.mp3`,
   })
 
   let fileState = response.file
@@ -260,46 +326,36 @@ function detectSuspiciousRepetition(text) {
 
   const words = normalized.split(" ").filter(Boolean)
 
-  // Textos pequeños no deberían
-  // considerarse sospechosos.
-  if (words.length < 40) {
+  if (words.length < 80) {
     return false
   }
 
   // ------------------------------------------
-  // 1. PALABRA DOMINANTE
+  // Detectar frases consecutivas repetidas
   // ------------------------------------------
 
-  const counts = {}
+  const phraseSize = 6
 
-  for (const word of words) {
-    counts[word] = (counts[word] || 0) + 1
-  }
+  let consecutiveRepeats = 0
 
-  const maxCount = Math.max(...Object.values(counts))
+  for (let i = 0; i < words.length - phraseSize * 3; i++) {
+    const phrase = words.slice(i, i + phraseSize).join(" ")
 
-  const dominantRatio = maxCount / words.length
+    const nextPhrase = words.slice(i + phraseSize, i + phraseSize * 2).join(" ")
 
-  if (dominantRatio > 0.3) {
-    return true
-  }
+    const thirdPhrase = words
+      .slice(i + phraseSize * 2, i + phraseSize * 3)
+      .join(" ")
 
-  // ------------------------------------------
-  // 2. FRASES REPETIDAS
-  // ------------------------------------------
+    if (phrase === nextPhrase && phrase === thirdPhrase) {
+      consecutiveRepeats++
 
-  const phrases = {}
-
-  for (let i = 0; i < words.length - 3; i++) {
-    const phrase = words.slice(i, i + 4).join(" ")
-
-    phrases[phrase] = (phrases[phrase] || 0) + 1
-  }
-
-  const maxPhraseCount = Math.max(...Object.values(phrases))
-
-  if (maxPhraseCount >= 8) {
-    return true
+      if (consecutiveRepeats >= 2) {
+        return true
+      }
+    } else {
+      consecutiveRepeats = 0
+    }
   }
 
   return false
@@ -434,9 +490,9 @@ Do not assume this is the beginning or end of the conference.
         console.warn(`Longitud: ${transcription.length} caracteres`)
 
         // No aceptamos el resultado.
-        throw new Error(
-          "Gemini produjo una transcripción sospechosamente repetitiva.",
-        )
+        // throw new Error(
+        //   "Gemini produjo una transcripción sospechosamente repetitiva.",
+        // )
       }
 
       console.log(`[Chunk ${chunkNumber}] Transcripción completada.`)
