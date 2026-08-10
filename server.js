@@ -420,7 +420,7 @@ async function transcribeChunk(filePath, chunkNumber) {
       const file = await uploadToGemini(filePath, chunkNumber)
 
       const model = genAI.getGenerativeModel({
-        model: "gemini-2.5-flash-lite",
+        model: "gemini-3.1-flash-lite",
       })
 
       // ------------------------------------------
@@ -1001,7 +1001,7 @@ async function cleanTranscriptChunk(transcriptChunk, chunkNumber) {
   }
 
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash-lite",
+    model: "gemini-3.1-flash-lite",
 
     generationConfig: {
       responseMimeType: "application/json",
@@ -1198,7 +1198,7 @@ async function extractSpeakers(cleanedTranscript, sheetData) {
   }
 
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash-lite",
+    model: "gemini-3.1-flash-lite",
 
     generationConfig: {
       responseMimeType: "application/json",
