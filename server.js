@@ -759,6 +759,37 @@ app.post("/transcribe", upload.any(), async (req, res) => {
 
     const chunks = await splitAudio(localFilePath, processingDirectory)
 
+    console.log("")
+    console.log("Verificando chunks antes de comenzar Gemini...")
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i]
+
+      if (!fs.existsSync(chunk)) {
+        throw new Error(
+          `Chunk desapareció antes de comenzar la transcripción: ${chunk}`,
+        )
+      }
+
+      const stats = fs.statSync(chunk)
+
+      if (stats.size === 0) {
+        throw new Error(
+          `Chunk vacío antes de comenzar la transcripción: ${chunk}`,
+        )
+      }
+
+      console.log(
+        `[VERIFY ${i}] ${path.basename(chunk)} - ${(
+          stats.size /
+          1024 /
+          1024
+        ).toFixed(2)} MB`,
+      )
+    }
+
+    console.log(`Todos los ${chunks.length} chunks están disponibles.`)
+
     // ------------------------------------------
     // 2. TRANSCRIBE CHUNKS
     // ------------------------------------------
@@ -845,7 +876,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     // ------------------------------------------
 
     if (processingDirectory) {
-      removeDirectory(processingDirectory)
+      console.log(`Processing directory: ${processingDirectory}`)
     }
   }
 })
@@ -856,7 +887,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
 
 const CLEAN_CHUNK_SIZE = 25000
 
-const CLEAN_MAX_CONCURRENCY = 3
+const CLEAN_MAX_CONCURRENCY = 1
 
 const CLEAN_MAX_RETRIES = 3
 
