@@ -313,10 +313,18 @@ async function uploadToGemini(filePath, chunkNumber) {
 // REPETITION DETECTION
 // --------------------------------------------------
 
+// --------------------------------------------------
+// REPETITION DETECTION
+// --------------------------------------------------
+
 function detectSuspiciousRepetition(text) {
   if (!text) {
     return false
   }
+
+  // ------------------------------------------
+  // NORMALIZE
+  // ------------------------------------------
 
   const normalized = text
     .toLowerCase()
@@ -326,75 +334,244 @@ function detectSuspiciousRepetition(text) {
 
   const words = normalized.split(" ").filter(Boolean)
 
-  // Una transcripción de 5 minutos debería
-  // tener bastantes palabras, pero no queremos
-  // analizar textos pequeños.
-  if (words.length < 100) {
+  if (words.length < 80) {
     return false
   }
 
-  // ------------------------------------------------
-  // 1. Detectar una frase de 5 palabras repetida
-  // muchas veces dentro del texto.
-  // ------------------------------------------------
+  // ------------------------------------------
+  // 1. SAME WORD REPEATED MANY TIMES
+  //
+  // Ej:
+  // "the the the the the the..."
+  // ------------------------------------------
 
-  const N = 5
+  let consecutiveWords = 1
+  let maxConsecutiveWords = 1
 
-  const occurrences = new Map()
+  for (let i = 1; i < words.length; i++) {
+    if (words[i] === words[i - 1]) {
+      consecutiveWords++
 
-  for (let i = 0; i <= words.length - N; i++) {
-    const phrase = words.slice(i, i + N).join(" ")
+      if (consecutiveWords > maxConsecutiveWords) {
+        maxConsecutiveWords = consecutiveWords
+      }
+    } else {
+      consecutiveWords = 1
+    }
+  }
 
-    const positions = occurrences.get(phrase) || []
+  if (maxConsecutiveWords >= 8) {
+    console.warn(
+      `⚠️ Repetición de palabra detectada: ${maxConsecutiveWords} veces consecutivas.`,
+    )
+
+    return true
+  }
+
+  // ------------------------------------------
+  // 2. REPEATED PHRASES
+  //
+  // Busca frases de diferentes tamaños.
+  //
+  // Ej:
+  // "three months in Tahoe"
+  // repetido decenas de veces.
+  // ------------------------------------------
+
+  const phraseSizes = [3, 4, 5, 6, 8, 10]
+
+  for (const phraseSize of phraseSizes) {
+    const occurrences = new Map()
+
+    for (let i = 0; i <= words.length - phraseSize; i++) {
+      const phrase = words.slice(i, i + phraseSize).join(" ")
+
+      const positions = occurrences.get(phrase) || []
+
+      positions.push(i)
+
+      occurrences.set(phrase, positions)
+    }
+
+    for (const [phrase, positions] of occurrences) {
+      // --------------------------------------
+      // Muchas apariciones
+      // --------------------------------------
+
+      if (positions.length >= 12) {
+        const first = positions[0]
+        const last = positions[positions.length - 1]
+
+        const span = last - first
+
+        // La frase aparece muchas veces
+        // en relativamente poco texto.
+        if (span < 3000) {
+          console.warn(
+            `⚠️ Frase repetida detectada: "${phrase}" (${positions.length} veces).`,
+          )
+
+          return true
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------
+  // 3. CONSECUTIVE BLOCK REPETITION
+  //
+  // Detecta:
+  //
+  // A B C D
+  // A B C D
+  // A B C D
+  //
+  // aunque no sean frases.
+  // ------------------------------------------
+
+  const blockSizes = [5, 8, 10, 15, 20]
+
+  for (const blockSize of blockSizes) {
+    for (let i = 0; i <= words.length - blockSize * 3; i++) {
+      const block1 = words.slice(i, i + blockSize).join(" ")
+
+      const block2 = words.slice(i + blockSize, i + blockSize * 2).join(" ")
+
+      const block3 = words.slice(i + blockSize * 2, i + blockSize * 3).join(" ")
+
+      if (block1 === block2 && block2 === block3) {
+        console.warn(
+          `⚠️ Bloque de ${blockSize} palabras repetido 3 veces consecutivas.`,
+        )
+
+        return true
+      }
+    }
+  }
+
+  // ------------------------------------------
+  // 4. REPEATED SENTENCES
+  //
+  // Detecta una misma oración repetida.
+  // ------------------------------------------
+
+  const sentences = normalized
+    .split(/[.!?]+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 20)
+
+  if (sentences.length >= 8) {
+    const sentenceCounts = new Map()
+
+    for (const sentence of sentences) {
+      const count = (sentenceCounts.get(sentence) || 0) + 1
+
+      sentenceCounts.set(sentence, count)
+
+      if (count >= 5) {
+        console.warn(
+          `⚠️ Oración repetida ${count} veces: "${sentence.slice(0, 150)}"`,
+        )
+
+        return true
+      }
+    }
+  }
+
+  // ------------------------------------------
+  // 5. OUTPUT DOMINATED BY ONE PHRASE
+  //
+  // Evita casos donde una frase aparece
+  // miles de veces pero no necesariamente
+  // de forma consecutiva.
+  // ------------------------------------------
+
+  const phraseSize = 4
+  const phraseCounts = new Map()
+
+  for (let i = 0; i <= words.length - phraseSize; i++) {
+    const phrase = words.slice(i, i + phraseSize).join(" ")
+
+    phraseCounts.set(phrase, (phraseCounts.get(phrase) || 0) + 1)
+  }
+
+  let mostRepeatedPhrase = null
+  let mostRepeatedCount = 0
+
+  for (const [phrase, count] of phraseCounts) {
+    if (count > mostRepeatedCount) {
+      mostRepeatedPhrase = phrase
+      mostRepeatedCount = count
+    }
+  }
+
+  if (mostRepeatedPhrase) {
+    const repetitionRatio = (mostRepeatedCount * phraseSize) / words.length
+
+    // Si una misma frase de 4 palabras
+    // representa más del 20% del texto,
+    // es extremadamente sospechoso.
+    if (mostRepeatedCount >= 20 && repetitionRatio > 0.2) {
+      console.warn(`⚠️ La transcripción está dominada por una frase repetida.`)
+
+      console.warn(`Frase: "${mostRepeatedPhrase}"`)
+
+      console.warn(`Apariciones: ${mostRepeatedCount}`)
+
+      console.warn(`Ratio aproximado: ${(repetitionRatio * 100).toFixed(1)}%`)
+
+      return true
+    }
+  }
+
+  // ------------------------------------------
+  // 6. DETECTAR REPETICIÓN DE UNA VENTANA
+  //
+  // Esto intenta detectar casos como:
+  //
+  // A B C D E F G
+  // A B C D E F G
+  //
+  // aunque haya pequeñas diferencias
+  // alrededor del bloque.
+  // ------------------------------------------
+
+  const WINDOW_SIZE = 20
+
+  const windows = new Map()
+
+  for (let i = 0; i <= words.length - WINDOW_SIZE; i++) {
+    const window = words.slice(i, i + WINDOW_SIZE).join(" ")
+
+    const positions = windows.get(window) || []
 
     positions.push(i)
 
-    occurrences.set(phrase, positions)
+    windows.set(window, positions)
   }
 
-  for (const [phrase, positions] of occurrences) {
-    if (positions.length < 15) {
-      continue
-    }
+  for (const [window, positions] of windows) {
+    if (positions.length >= 3) {
+      const first = positions[0]
+      const last = positions[positions.length - 1]
 
-    // Comprobar si las apariciones están
-    // muy concentradas.
-    const first = positions[0]
-    const last = positions[positions.length - 1]
+      const span = last - first
 
-    const span = last - first
+      if (span < 5000) {
+        console.warn(
+          `⚠️ Ventana de ${WINDOW_SIZE} palabras repetida ${positions.length} veces.`,
+        )
 
-    // Si una misma frase aparece 15+ veces
-    // en menos de 2000 palabras, es extremadamente
-    // sospechoso.
-    if (positions.length >= 15 && span < 2000) {
-      console.warn(
-        `⚠️ Repetición sospechosa detectada: "${phrase}" (${positions.length} veces)`,
-      )
+        console.warn(`Contenido: "${window.slice(0, 200)}..."`)
 
-      return true
+        return true
+      }
     }
   }
 
-  // ------------------------------------------------
-  // 2. Detectar bloques repetidos
-  // ------------------------------------------------
-
-  const BLOCK_SIZE = 10
-
-  for (let i = 0; i < words.length - BLOCK_SIZE * 3; i++) {
-    const block1 = words.slice(i, i + BLOCK_SIZE).join(" ")
-
-    const block2 = words.slice(i + BLOCK_SIZE, i + BLOCK_SIZE * 2).join(" ")
-
-    const block3 = words.slice(i + BLOCK_SIZE * 2, i + BLOCK_SIZE * 3).join(" ")
-
-    if (block1 === block2 && block2 === block3) {
-      console.warn("⚠️ Bloque de texto repetido 3 veces consecutivas.")
-
-      return true
-    }
-  }
+  // ------------------------------------------
+  // 7. NO REPETITION DETECTED
+  // ------------------------------------------
 
   return false
 }
