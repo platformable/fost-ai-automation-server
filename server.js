@@ -375,6 +375,10 @@ async function transcribeChunk(filePath, chunkNumber) {
 
       console.log(`[Chunk ${chunkNumber}] Intento ${attempt}/${MAX_RETRIES}`)
 
+      // ------------------------------------------
+      // UPLOAD
+      // ------------------------------------------
+
       const file = await uploadToGemini(filePath, chunkNumber)
 
       const model = genAI.getGenerativeModel({
@@ -385,54 +389,133 @@ async function transcribeChunk(filePath, chunkNumber) {
       // PROMPT
       // ------------------------------------------
 
-      const prompt = `
+      let prompt
+
+      if (attempt === 1) {
+        prompt = `
 You are a professional conference transcription system.
 
 You are processing ONE SEGMENT of a longer conference recording.
 
-Your ONLY task is to transcribe actual human speech contained in this audio.
-
-CRITICAL ANTI-HALLUCINATION RULES:
-
-- Only transcribe speech that is actually audible.
-- If there is silence, output nothing.
-- If there is background noise, do not turn it into words.
-- If there is microphone noise, do not turn it into words.
-- If speech is genuinely unintelligible, do not invent words.
-- NEVER repeat a word, phrase or sentence simply because the audio contains silence or noise.
-- NEVER generate text to fill empty parts of the audio.
-- NEVER loop or repeat the same sentence.
-- NEVER summarize.
-- NEVER describe what is happening in the audio.
-- NEVER add commentary.
-
-TRANSCRIPTION RULES:
-
-- Preserve chronological order.
-- Transcribe all meaningful human speech.
-- Preserve technical terminology.
-- Preserve names, numbers, statistics and product names.
-- Remove obvious verbal fillers such as "um", "uh", "you know", etc. when they do not add meaning.
-- Remove obvious stuttering when the intended phrase is clear.
-- Do not remove meaningful words.
-- Do not invent missing words.
-- Do not reconstruct sentences that cannot be understood.
-- Do not repeat content.
-- Return ONLY the transcription.
-- Return plain text.
+Your task is to create a faithful textual record of the
+human speech that is actually audible in this audio.
 
 IMPORTANT:
 
-This audio segment may contain long periods of silence.
+The audio provided in this request is the ONLY source of truth.
 
-If you encounter silence or non-speech audio:
-DO NOT WRITE ANYTHING FOR THAT PART.
+Only transcribe speech that you can actually hear in the audio.
 
-If the entire segment contains no understandable speech,
-return an empty response.
+Rules:
 
-Do not assume this is the beginning or end of the conference.
+- Preserve chronological order.
+- Transcribe all meaningful spoken content.
+- Do not summarize.
+- Do not paraphrase.
+- Do not invent information.
+- Do not add information from your general knowledge.
+- Do not reconstruct missing speech.
+- Preserve technical terminology.
+- Preserve names, companies, products and numbers.
+- Preserve the speaker's actual meaning and wording.
+- Remove obvious verbal fillers such as "um", "uh", "erm"
+  when they do not add meaning.
+- Remove obvious transcription artifacts.
+- Remove accidental stuttering when the intended phrase is clear.
+- Do not remove meaningful repetition.
+- Do not describe the audio.
+- Do not provide commentary.
+- Do not provide a summary.
+
+IMPORTANT ANTI-HALLUCINATION RULE:
+
+If a portion contains silence, background noise, microphone noise,
+room ambience, applause, or unintelligible audio, do not invent speech.
+
+Never generate words simply because you expect someone to be speaking.
+
+If there is no understandable speech, output nothing for that portion.
+
+Return ONLY the transcription as plain text.
 `
+      } else if (attempt === 2) {
+        prompt = `
+Create a faithful textual record of the spoken content
+contained in the supplied audio segment.
+
+Use ONLY the audio in this request.
+
+The objective is to accurately capture what is actually audible,
+in chronological order.
+
+Rules:
+
+- Transcribe actual human speech.
+- Preserve substantive spoken information.
+- Preserve names, technical terms, companies, products,
+  numbers and statistics.
+- Preserve the speaker's meaning.
+- Remove obvious filler sounds such as "um", "uh" and "erm".
+- Remove obvious stutters and transcription artifacts.
+- Do not summarize.
+- Do not paraphrase.
+- Do not invent.
+- Do not use outside knowledge.
+- Do not complete missing sentences from context.
+- Do not add information that is not audible.
+- Do not repeat content.
+- Do not generate text during silence or background noise.
+
+Use only the supplied audio as your source.
+
+Return ONLY the resulting transcription.
+`
+      } else {
+        prompt = `
+Transcribe the human speech that is actually audible
+in this audio segment.
+
+This is a segment of a conference recording.
+
+Use ONLY the supplied audio.
+
+Capture the spoken information faithfully and chronologically.
+
+Do not summarize.
+Do not explain.
+Do not add information.
+Do not use outside knowledge.
+Do not invent missing words.
+Do not reconstruct unclear speech.
+Do not repeat sentences.
+
+Remove only obvious filler sounds and accidental stuttering.
+
+Preserve:
+
+- technical terminology
+- names
+- companies
+- products
+- numbers
+- statistics
+- meaningful wording
+
+Ignore silence, room noise, microphone noise and unintelligible audio.
+
+Return ONLY the transcription.
+`
+      }
+
+      // ------------------------------------------
+      // GENERATION CONFIG
+      // ------------------------------------------
+
+      const temperature = attempt === 1 ? 0 : attempt === 2 ? 0.1 : 0.2
+
+      // ------------------------------------------
+      // GEMINI REQUEST
+      // ------------------------------------------
 
       const result = await model.generateContent({
         contents: [
@@ -456,44 +539,106 @@ Do not assume this is the beginning or end of the conference.
         ],
 
         generationConfig: {
-          temperature: 0,
+          temperature,
         },
       })
 
-      const transcription = result.response.text().trim()
+      // ------------------------------------------
+      // CHECK GEMINI CANDIDATE
+      // ------------------------------------------
+
+      const candidate = result.response?.candidates?.[0]
+
+      const finishReason = candidate?.finishReason
+
+      console.log(
+        `[Chunk ${chunkNumber}] Finish reason: ${finishReason || "NONE"}`,
+      )
 
       // ------------------------------------------
-      // EMPTY TRANSCRIPTION
+      // RECITATION
+      // ------------------------------------------
+
+      if (finishReason === "RECITATION") {
+        console.warn("")
+        console.warn(
+          `⚠️ [Chunk ${chunkNumber}] Gemini bloqueó la respuesta por RECITATION.`,
+        )
+
+        console.warn(
+          `[Chunk ${chunkNumber}] Se utilizará un prompt alternativo en el siguiente intento.`,
+        )
+
+        throw new Error("GEMINI_RECITATION")
+      }
+
+      // ------------------------------------------
+      // OTHER BLOCKED RESPONSES
+      // ------------------------------------------
+
+      if (
+        finishReason === "SAFETY" ||
+        finishReason === "BLOCKLIST" ||
+        finishReason === "PROHIBITED_CONTENT"
+      ) {
+        throw new Error(`GEMINI_BLOCKED_${finishReason}`)
+      }
+
+      // ------------------------------------------
+      // GET TEXT
+      // ------------------------------------------
+
+      let transcription
+
+      try {
+        transcription = result.response.text().trim()
+      } catch (responseError) {
+        console.error(`[Chunk ${chunkNumber}] Gemini no pudo devolver texto.`)
+
+        console.error(responseError)
+
+        throw responseError
+      }
+
+      // ------------------------------------------
+      // EMPTY RESPONSE
       // ------------------------------------------
 
       if (!transcription) {
-        console.log(`[Chunk ${chunkNumber}] Sin habla detectable.`)
+        console.log(`[Chunk ${chunkNumber}] Gemini no detectó habla.`)
 
         return {
           chunk: chunkNumber,
+
           transcription: "",
         }
       }
 
       // ------------------------------------------
-      // CHECK REPETITION
+      // REPETITION DETECTION
       // ------------------------------------------
 
       const suspicious = detectSuspiciousRepetition(transcription)
 
       if (suspicious) {
         console.warn("")
+        console.warn(`⚠️ [Chunk ${chunkNumber}] Posible repetición detectada.`)
+
         console.warn(
-          `⚠️ [Chunk ${chunkNumber}] Posible repetición/alucinación detectada.`,
+          `[Chunk ${chunkNumber}] Longitud: ${transcription.length} caracteres`,
         )
 
-        console.warn(`Longitud: ${transcription.length} caracteres`)
-
-        // No aceptamos el resultado.
-        // throw new Error(
-        //   "Gemini produjo una transcripción sospechosamente repetitiva.",
-        // )
+        // IMPORTANTE:
+        // NO lanzamos error.
+        //
+        // El detector es solamente una señal.
+        // No queremos descartar una transcripción
+        // legítima de 100k+ caracteres.
       }
+
+      // ------------------------------------------
+      // SUCCESS
+      // ------------------------------------------
 
       console.log(`[Chunk ${chunkNumber}] Transcripción completada.`)
 
@@ -501,6 +646,7 @@ Do not assume this is the beginning or end of the conference.
 
       return {
         chunk: chunkNumber,
+
         transcription,
       }
     } catch (error) {
@@ -513,8 +659,13 @@ Do not assume this is the beginning or end of the conference.
 
       console.error(error.message)
 
+      // ------------------------------------------
+      // RETRY
+      // ------------------------------------------
+
       if (attempt < MAX_RETRIES) {
-        const waitTime = 5000 * attempt
+        const waitTime =
+          error.message === "GEMINI_RECITATION" ? 3000 : 5000 * attempt
 
         console.log(
           `[Chunk ${chunkNumber}] Reintentando en ${
@@ -526,6 +677,10 @@ Do not assume this is the beginning or end of the conference.
       }
     }
   }
+
+  // ------------------------------------------
+  // ALL ATTEMPTS FAILED
+  // ------------------------------------------
 
   throw lastError
 }
