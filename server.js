@@ -683,10 +683,24 @@ async function processChunks(chunks) {
         return
       }
 
-      console.log("")
-      console.log(`[Worker ${workerId}] Procesando chunk ${index}`)
+      console.log(
+        `[Worker ${workerId}] Processing chunk ${index + 1}/${chunks.length}`,
+      )
 
-      results[index] = await transcribeChunk(chunks[index], index)
+      try {
+        results[index] = await transcribeChunk(chunks[index], index)
+      } catch (error) {
+        console.error(`[Chunk ${index}] FAILED after all retries.`)
+
+        console.error(error.message)
+
+        results[index] = {
+          chunk: index,
+          transcription: "",
+          failed: true,
+          error: error.message,
+        }
+      }
     }
   }
 
@@ -701,7 +715,6 @@ async function processChunks(chunks) {
 
   return results
 }
-
 // --------------------------------------------------
 // MERGE TRANSCRIPTIONS
 // --------------------------------------------------
@@ -795,6 +808,23 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     // ------------------------------------------
 
     const results = await processChunks(chunks)
+
+    const failedChunks = results.filter((result) => result.failed)
+
+    console.log(
+      `Chunks completados: ${
+        results.length - failedChunks.length
+      }/${results.length}`,
+    )
+
+    console.log(`Chunks fallidos: ${failedChunks.length}`)
+
+    if (failedChunks.length > 0) {
+      console.warn(
+        "⚠️ Chunks que necesitan reprocesamiento:",
+        failedChunks.map((chunk) => chunk.chunk),
+      )
+    }
 
     // ------------------------------------------
     // 3. MERGE
