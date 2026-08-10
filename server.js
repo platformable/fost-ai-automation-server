@@ -853,7 +853,7 @@ app.post("/transcribe", upload.any(), async (req, res) => {
     console.error("========================================")
     console.error(error)
     console.error("========================================")
-    console.error(`[Chunk ${chunkNumber}] Error type:`, error.message)
+    console.error("Error type:", error.message)
 
     if (localFilePath && fs.existsSync(localFilePath)) {
       try {
