@@ -155,40 +155,87 @@ app.post("/clean-transcription", async (req, res) => {
 
     const sheetDataString = JSON.stringify(sheetData)
 
-    const prompt = `Please review the attached transcript and perform the following tasks carefully, IN THIS ORDER.
+    const prompt = `
+Please review the attached transcript document and perform the following tasks carefully.
 
-STEP 1 - Identify speakers from the TRANSCRIPT ONLY
-- Read the transcript and determine how many DISTINCT people actually speak (e.g. host + 1 guest = 2 speakers).
-- Do NOT use the spreadsheet data to decide who the speakers are. The spreadsheet is only used later, for metadata lookup.
-- The number of objects you return MUST equal the number of distinct speakers you found in the transcript. If there are 2 people speaking, return exactly 2 objects. Never generate one object per spreadsheet row.
-- Only include people who have actual spoken lines transcribed as their own turn. Do NOT include people who are merely mentioned, thanked, or referenced by others but never speak themselves.
+1. Clean the Transcript
+Remove any text that is clearly not part of the speaker's actual spoken words, such as transcription artifacts, notes, editing marks, duplicated fragments, incomplete transcription tags, stray characters, or other non-spoken content.
+Correct obvious transcription errors, including:
+words split incorrectly (e.g., "w-write")
+obvious spelling mistakes
+obvious grammar or transcription mistakes that make the sentence unreadable
+incomplete words caused by transcription issues
+Do not rewrite, paraphrase, summarize, or improve the speaker's wording.
+Preserve the speaker's original text and phrasing as much as possible.
+Only make corrections when the text is clearly incorrect, incomplete, or unintelligible.
+Maintain all existing formatting, including colors, highlights, emphasis, headings, spacing, and overall document structure.
 
-STEP 2 - Clean the transcript
-- Remove any text that is clearly not part of the speaker's actual spoken words (filler noise, transcription artifacts).
-- Correct obvious transcription errors, including split words and spelling mistakes.
-- Do NOT rewrite, paraphrase, summarize, or improve the speaker's wording.
+2. Separate Content by Speaker
+Create a separate document for each speaker.
+Each document should contain only the content spoken by that speaker.
+Do not mix content from multiple speakers.
+Preserve the original order of the speaker's remarks.
 
-STEP 3 - Aggregate content per speaker
-- CRITICAL: If a speaker talks multiple times throughout the transcript, merge ALL of their segments into ONE single "cleaned_content" string, in chronological order.
-- Never create two objects for the same person. One object = one unique person.
-- Do not create objects for people who are mentioned but never speak. Only include speakers with actual spoken lines.
-- Do not invent, guess, or modify last names. If a speaker's last name is not clear in the transcript, leave it blank or null.
-- Do not create objects for "host" or "moderator".
+3. Speaker and Session Metadata Lookup
+Use the worksheet/tab named  ${sheetDataString} as the authoritative source for speaker and session information.
+When retrieving the Speaker, Title, Role, and Organization:
+Search for the speaker in ${sheetDataString}.
+If the speaker name in the transcript does not exactly match the sheet (for example: spelling differences, transcription errors, missing accents, abbreviated names, initials, formatting differences, or slight variations), identify the closest matching speaker and use the information from the sheet.
+Standardize the speaker name using the spelling found in the sheet.
+Use the corresponding talk title, role, and organization from the same row in the sheet.
+If multiple similar names exist, use the transcript content and session context to determine the correct match.
+Treat the spreadsheet as the source of truth whenever there is a discrepancy between the transcript and the sheet.
+Do not leave speaker information blank because of minor spelling or transcription differences.
+If the transcript speaker name is partially incorrect, replace it with the official version from the sheet.
+Example:If the transcript contains "Rahul Durega" and the sheet contains "Rahul Dureja", use "Rahul Dureja" and the associated 
+session information from the sheet.
 
-STEP 4 - Match metadata using the spreadsheet (source of truth for METADATA ONLY)
-- For each speaker identified in STEP 1, look up their matching row in the spreadsheet data below to fill in "metadata" (conference, date, title, role, organization).
-- Match by name similarity. Do NOT invent, guess, or modify last names.
-- If a speaker from the transcript has no match in the spreadsheet, still include them with whatever metadata fields you can infer as null/empty, but do NOT skip them and do NOT add extra people who are in the spreadsheet but don't appear in the transcript.
-
-STEP 5 - Generate topics
-- Create 10-20 highly relevant, searchable topic tags for each speaker based on their actual spoken content.
-
-- Only include people who have actual spoken lines transcribed as their own turn. Do NOT include people who are merely mentioned, thanked, or referenced by others but never speak themselves.
-
-- do not include Host/Moderator or unknown speakers in the final output. Only include speakers with actual spoken lines.
-
-Here is the Reference Spreadsheet Data (for metadata matching only, NOT for determining who the speakers are):
-${sheetDataString}`
+4. Add Metadata Header to Each Speaker Document
+At the very top of each speaker document, insert the following metadata block.
+Formatting requirements:
+Font: Roboto
+Size: 12 pt
+Color: Black
+Populate the fields as follows:
+ID: talk-XX-singapore26
+Use sequential numbering starting from: talk-10-singapore26
+Increment the number for each speaker document.
+Conference: Apidays Sigapore 2026
+Title: Retrieve from  ${sheetDataString}
+Display the title in bold.
+Speaker: Retrieve from  ${sheetDataString}
+Role: Retrieve from  ${sheetDataString}
+Organization: Retrieve from  ${sheetDataString}
+Date: May 13, 2026
+Topics: [Generate topic tags based on the speaker's transcript]
+Topic requirements:
+Create approximately 10–20 highly relevant searchable topic tags.
+Use terms and concepts discussed by the speaker.
+Include technologies, methodologies, business concepts, standards, use cases, industries, products, frameworks, and key themes mentioned in the talk.
+Prefer concise tags separated by commas.
+Do not use generic tags unless they are central to the presentation.
+Prioritize terminology that would help someone find this transcript through search.
+Example:
+ID: talk-10-apidaysny26
+Conference: Apidays New York 2026
+Title: AI without Integration is Just Talk: How to Scale Agent Connectivity with APIs and MCP
+Speaker: Rahul Dureja
+Role: Regional Field CTO
+Organization: Workato
+Date: May 13, 2026
+Topics: Agentic AI, MCP, enterprise agents, APIs, API integration, orchestration, governance, observability, trust, control plane, composable capabilities, intent-based APIs, PBCs, system decoupling, production AI agents, security, billing automation
+5. Quality Assurance Checklist
+Before finalizing each speaker document:
+Verify that only the selected speaker's content is included.
+Verify that all metadata matches the corresponding ${sheetDataString}.
+Verify that speaker names have been standardized using ${sheetDataString} values.
+Verify that titles, roles, and organizations come from ${sheetDataString}, not from the transcript.
+Verify that all formatting from the source document has been preserved.
+Verify that no speaker wording has been unnecessarily rewritten.
+Verify that all obvious transcription artifacts have been removed.
+Verify that the document remains faithful to the original spoken content.
+Verify that the generated topics accurately reflect the content of the speaker's remarks.
+Output one clean, finalized document per speaker.`
 
     const result = await model.generateContent([
       { text: `TRANSCRIPT TO CLEAN:\n${transcriptionText}` },
