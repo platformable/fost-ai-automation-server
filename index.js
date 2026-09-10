@@ -170,6 +170,13 @@ Preserve the speaker's original text and phrasing as much as possible.
 Only make corrections when the text is clearly incorrect, incomplete, or unintelligible.
 Maintain all existing formatting, including colors, highlights, emphasis, headings, spacing, and overall document structure.
 
+1.2 Verify Cleaned Transcript
+After cleaning the transcript, review the content to ensure that all non-spoken elements have been removed and that the text accurately reflects the speaker's original words.
+Check for any remaining transcription errors and correct them as needed.
+Do not alter the meaning or intent of the speaker's statements.
+
+Remove filler words such as "um," "uh," "like," "you know," and other similar expressions that do not contribute to the meaning of the transcript.
+
 2. Separate Content by Speaker
 Create a separate document for each speaker.
 Each document should contain only the content spoken by that speaker.
