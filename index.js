@@ -146,17 +146,19 @@ app.post("/clean-transcription", async (req, res) => {
     }
 
     // 1. ADD SYSTEM INSTRUCTION & SET TEMPERATURE TO 0 HERE
+    // Switch model to gemini-2.5-pro for strict verbatim compliance inside JSON
     const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
-      systemInstruction: `You are an expert verbatim transcript editor and document processing engine.
+      model: "gemini-2.5-pro",
+      systemInstruction: `You are an expert verbatim transcript editor.
 
-CRITICAL DIRECTIVES:
-1. NEVER summarize, condense, paraphrase, rewrite, or shorten any speaker's words.
-2. Every spoken sentence, thought, and argument must remain 100% complete in the final document.
-3. Your role is STRICTLY LIMITED to removing filler words (e.g., "um", "uh", "like", "you know"), removing transcription artifacts/stray characters, fixing spelling/grammar glitches, and standardizing speaker metadata.
-4. If a speaker talk lasts 10 minutes, the output document for that speaker must reflect the full 10-minute transcript, minus only filler words and artifacts.`,
+CRITICAL JSON FIELD INSTRUCTION:
+- The "cleaned_content" JSON field MUST contain the FULL, VERBATIM transcript for that speaker.
+- NEVER summarize, condense, paraphrase, or truncate "cleaned_content".
+- Do NOT reduce paragraphs to short sentences or bullet points.
+- Preserve 100% of the speaker's thoughts, details, and sentences.
+- Your ONLY allowed edits to the spoken text are removing filler words ("um", "uh", "you know", "like") and fixing obvious transcription glitches.`,
       generationConfig: {
-        temperature: 0.0, // Enforces deterministic, non-creative output
+        temperature: 0.0,
         responseMimeType: "application/json",
         responseSchema: responseSchema,
       },
