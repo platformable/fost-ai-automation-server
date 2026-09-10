@@ -118,7 +118,14 @@ app.post("/clean-transcription", async (req, res) => {
   }
 
   try {
-    const responseSchema = {
+    const sheetDataString = JSON.stringify(sheetData)
+
+    // =========================================================================
+    // STEP 1: Extract Speakers & Metadata (JSON Mode)
+    // =========================================================================
+    console.log("Step 1: Segmenting speakers and extracting metadata...")
+
+    const step1Schema = {
       type: SchemaType.ARRAY,
       items: {
         type: SchemaType.OBJECT,
@@ -139,112 +146,95 @@ app.post("/clean-transcription", async (req, res) => {
               },
             },
           },
-          cleaned_content: { type: SchemaType.STRING },
+          raw_content: { type: SchemaType.STRING },
         },
-        required: ["id", "speaker", "metadata", "cleaned_content"],
+        required: ["id", "speaker", "metadata", "raw_content"],
       },
     }
 
-    // 1. ADD SYSTEM INSTRUCTION & SET TEMPERATURE TO 0 HERE
-    // Switch model to gemini-2.5-pro for strict verbatim compliance inside JSON
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-pro",
-      systemInstruction: `You are an expert verbatim transcript editor.
-
-CRITICAL JSON FIELD INSTRUCTION:
-- The "cleaned_content" JSON field MUST contain the FULL, VERBATIM transcript for that speaker.
-- NEVER summarize, condense, paraphrase, or truncate "cleaned_content".
-- Do NOT reduce paragraphs to short sentences or bullet points.
-- Preserve 100% of the speaker's thoughts, details, and sentences.
-- Your ONLY allowed edits to the spoken text are removing filler words ("um", "uh", "you know", "like") and fixing obvious transcription glitches.`,
+    const metadataModel = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
       generationConfig: {
         temperature: 0.0,
         responseMimeType: "application/json",
-        responseSchema: responseSchema,
+        responseSchema: step1Schema,
       },
     })
 
-    const sheetDataString = JSON.stringify(sheetData)
+    const step1Prompt = `
+Analyze the transcript below and match speakers against the dataset: ${sheetDataString}.
 
-    // 2. USER PROMPT FOCUSES ON THE INPUT DATA & WORKFLOW
-    const prompt = `
-Execute the following tasks on the provided transcript.
+TASKS:
+1. Identify all speakers in the transcript.
+2. Match each speaker to ${sheetDataString} to pull their official name, title, role, and organization.
+3. Group the raw, unedited spoken text belonging to each speaker into "raw_content". Copy the exact raw text segments from the transcript without shortening or summarizing.
+4. Generate 10-20 relevant topic tags for each speaker.
+5. Set 'id' sequentially as "talk-10-singapore26", "talk-11-singapore26", etc.
+6. Set 'conference' to "Apidays Singapore 2026" and 'date' to "May 13, 2026".
 
-### INPUT DATA:
-- Metadata Source of Truth: ${sheetDataString}
-- Raw Transcript:
+TRANSCRIPT:
 ${transcriptionText}
-
----
-
-### WORKFLOW:
-
-1. CLEAN TRANSCRIPT (VERBATIM ONLY)
-- Remove filler words ("um", "uh", "you know", "like") and non-spoken artifacts (stray characters, editing notes, split-word glitches like "w-write").
-- Fix obvious spelling glitches that make sentences unreadable.
-- DO NOT summarize, paraphrase, or delete spoken sentences. Preserve original phrasing completely.
-
-2. SEPARATE BY SPEAKER
-- Group content by speaker into distinct array items.
-- Maintain original chronological order of remarks for each speaker.
-
-3. METADATA LOOKUP & STANDARDIZATION
-- Match the speaker name against the authoritative dataset: ${sheetDataString}.
-- Standardize the speaker name, talk title, role, and organization using values from ${sheetDataString}.
-- Use ${sheetDataString} as the source of truth whenever there is a discrepancy.
-
-4. METADATA VALUES TO SET:
-- id: Sequential numbering format "talk-XX-singapore26" starting from "talk-10-singapore26" (e.g. talk-10-singapore26, talk-11-singapore26).
-- conference: "Apidays Singapore 2026"
-- date: Strictly set to "May 13, 2026"
-- topics: Generate 10–20 comma-separated, highly specific technical/business topic tags based on the talk content.
 `
 
-    const result = await model.generateContent(prompt)
+    const step1Result = await metadataModel.generateContent(step1Prompt)
+    let speakerSegments = JSON.parse(step1Result.response.text())
 
-    const cleanedTranscriptionText = result.response.text()
-    console.log("Transcription cleaning completed")
-
-    let finalData = JSON.parse(cleanedTranscriptionText)
-
-    // --- Safety net: dedupe + merge by speaker in case the model splits someone into multiple objects ---
-    const originalCount = finalData.length
-    const mergedBySpeaker = new Map()
-
-    for (const entry of finalData) {
-      const key = (entry.speaker || "")
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, " ")
-
+    // Deduplicate / merge segments by speaker if split
+    const mergedMap = new Map()
+    for (const item of speakerSegments) {
+      const key = (item.speaker || "").trim().toLowerCase()
       if (!key) continue
-
-      if (mergedBySpeaker.has(key)) {
-        const existing = mergedBySpeaker.get(key)
-        existing.cleaned_content =
-          `${existing.cleaned_content} ${entry.cleaned_content}`.trim()
-        const existingTopics = existing.metadata?.topics || []
-        const newTopics = entry.metadata?.topics || []
-        existing.metadata.topics = [
-          ...new Set([...existingTopics, ...newTopics]),
-        ]
-        existing.metadata = {
-          ...entry.metadata,
-          ...existing.metadata,
-          topics: existing.metadata.topics,
-        }
+      if (mergedMap.has(key)) {
+        const existing = mergedMap.get(key)
+        existing.raw_content += "\n\n" + item.raw_content
       } else {
-        mergedBySpeaker.set(key, entry)
+        mergedMap.set(key, item)
       }
     }
+    speakerSegments = Array.from(mergedMap.values())
 
-    finalData = Array.from(mergedBySpeaker.values())
+    // =========================================================================
+    // STEP 2: Clean Each Speaker's Text Verbatim (Plain Text Mode)
+    // =========================================================================
+    console.log(
+      `Step 2: Cleaning verbatim text for ${speakerSegments.length} speakers...`,
+    )
 
-    if (finalData.length !== originalCount) {
-      console.warn(
-        `⚠️ Speaker dedupe kicked in for "${fileName}": model returned ${originalCount} objects, merged down to ${finalData.length}.`,
+    const cleanerModel = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
+      systemInstruction: `You are a strict verbatim transcript editor.
+Your ONLY job is to remove filler words (e.g., "um", "uh", "you know", "like") and fix obvious transcription typos/glitches.
+
+CRITICAL RULES:
+- DO NOT summarize, condense, paraphrase, or delete any sentences.
+- Preserve 100% of the original text length, structure, and phrasing.
+- Return ONLY the cleaned text. Do NOT add commentary, headers, or markdown wrappers.`,
+      generationConfig: {
+        temperature: 0.0, // Plain text mode — avoids JSON string compression
+      },
+    })
+
+    const finalData = []
+
+    for (const segment of speakerSegments) {
+      console.log(
+        `Cleaning transcript verbatim for speaker: ${segment.speaker}...`,
       )
+
+      const cleanPrompt = `Remove filler words and fix typos in the following transcript verbatim. Do NOT summarize or delete any sentences:\n\n${segment.raw_content}`
+
+      const cleanResult = await cleanerModel.generateContent(cleanPrompt)
+      const cleanedText = cleanResult.response.text().trim()
+
+      finalData.push({
+        id: segment.id,
+        speaker: segment.speaker,
+        metadata: segment.metadata,
+        cleaned_content: cleanedText,
+      })
     }
+
+    console.log("Transcription cleaning completed successfully.")
 
     res.json({
       success: true,
