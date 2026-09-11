@@ -1609,7 +1609,7 @@ app.post("/clean-transcription", async (req, res) => {
     const sheetDataString = JSON.stringify(sheetData)
 
     const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-pro",
+      model: "gemini-3.1-flash-lite",
       systemInstruction: `You are a strict verbatim transcript editor.
 CRITICAL DIRECTIVES:
 1. NEVER summarize, condense, paraphrase, or rewrite.
