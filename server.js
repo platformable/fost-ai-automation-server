@@ -1596,155 +1596,117 @@ END REFERENCE DATA.
 // --------------------------------------------------
 
 app.post("/clean-transcription", async (req, res) => {
-  console.log("Cleaning transcription request received")
-
+  console.log("Cleaning transcription request received (Plain-Text Mode)")
   const { fileName, transcriptionText, sheetData } = req.body
 
-  if (!transcriptionText) {
-    return res.status(400).json({
-      error: "Missing transcriptionText in the request body.",
-    })
-  }
-
   if (!sheetData) {
-    return res.status(400).json({
-      error: "Missing sheetData in the request body.",
-    })
+    return res
+      .status(400)
+      .json({ error: "Missing sheetData in the request body." })
   }
 
   try {
-    // ------------------------------------------
-    // 1. SPLIT TRANSCRIPT
-    // ------------------------------------------
+    const sheetDataString = JSON.stringify(sheetData)
 
-    const chunks = splitTranscript(transcriptionText)
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-pro",
+      systemInstruction: `You are a strict verbatim transcript editor.
+CRITICAL DIRECTIVES:
+1. NEVER summarize, condense, paraphrase, or rewrite.
+2. Every spoken sentence must remain 100% complete in the final document.
+3. Your ONLY allowed edits are removing filler words (e.g., "um", "uh", "like") and fixing obvious transcription glitches.`,
+      generationConfig: {
+        temperature: 0.0,
+      },
+    })
 
-    console.log(`Transcript split into ${chunks.length} chunks.`)
+    const prompt = `
+Execute the following workflow on the transcript.
 
-    console.log(`Original transcript: ${transcriptionText.length} chars`)
+### INPUT DATA:
+- Metadata Source of Truth: ${sheetDataString}
+- Raw Transcript:
+${transcriptionText}
 
-    // ------------------------------------------
-    // 2. CLEAN CHUNKS
-    // ------------------------------------------
+### INSTRUCTIONS:
+1. Separate content by speaker, keeping chronological order.
+2. Clean the text verbatim (remove filler words/typos). DO NOT SUMMARIZE.
+3. Lookup the official speaker name, title, role, and organization from the Source of Truth.
 
-    const cleanedChunks = await cleanTranscriptChunks(chunks)
+### OUTPUT FORMAT:
+You MUST output the result for each speaker using EXACTLY the following structure. Do not output JSON.
 
-    // ------------------------------------------
-    // 3. MERGE CLEANED TRANSCRIPT
-    // ------------------------------------------
+===START_SPEAKER===
+ID: [Generate sequential ID starting from talk-10-singapore26]
+Conference: Apidays Singapore 2026
+Title: [Matched Title]
+Speaker: [Matched Name]
+Role: [Matched Role]
+Organization: [Matched Org]
+Date: May 13, 2026
+Topics: [10-20 comma-separated tags]
+===CONTENT_START===
+[FULL VERBATIM CLEANED TRANSCRIPT HERE]
+===END_SPEAKER===
+`
 
-    const cleanedTranscript = cleanedChunks
-      .sort((a, b) => a.chunk - b.chunk)
-      .map((chunk) => chunk.cleaned_content)
-      .join("\n\n")
+    const result = await model.generateContent(prompt)
+    const rawOutput = result.response.text()
 
-    console.log(`Cleaned transcript: ${cleanedTranscript.length} chars`)
+    const finalData = []
+    const speakerBlocks = rawOutput
+      .split("===START_SPEAKER===")
+      .filter((b) => b.trim())
 
-    // ------------------------------------------
-    // 4. IDENTIFY SPEAKERS
-    // ------------------------------------------
+    for (const block of speakerBlocks) {
+      const endCleaned = block.split("===END_SPEAKER===")[0].trim()
+      const parts = endCleaned.split("===CONTENT_START===")
+      if (parts.length < 2) continue
 
-    const finalData = await extractSpeakers(cleanedTranscript, sheetData)
+      const headerPart = parts[0].trim()
+      const content = parts.slice(1).join("===CONTENT_START===").trim()
 
-    // ------------------------------------------
-    // 5. SAFETY DEDUPE
-    // ------------------------------------------
+      const headerLines = headerPart.split("\n")
 
-    const mergedBySpeaker = new Map()
+      const metadata = {}
+      let id = "",
+        speakerName = ""
 
-    for (const entry of finalData) {
-      if (!entry) {
-        continue
-      }
+      headerLines.forEach((line) => {
+        const match = line.match(/^([^:]+):\s*(.*)$/)
+        if (match) {
+          const key = match[1].trim().toLowerCase()
+          const value = match[2].trim()
 
-      const speaker =
-        typeof entry.speaker === "string" ? entry.speaker.trim() : ""
-
-      if (!speaker) {
-        continue
-      }
-
-      const key = speaker.toLowerCase().replace(/\s+/g, " ")
-
-      if (
-        key === "host" ||
-        key === "moderator" ||
-        key === "interviewer" ||
-        key === "presenter" ||
-        key === "unknown"
-      ) {
-        continue
-      }
-
-      if (mergedBySpeaker.has(key)) {
-        const existing = mergedBySpeaker.get(key)
-
-        const content = entry.cleaned_content || ""
-
-        if (content) {
-          existing.cleaned_content =
-            `${existing.cleaned_content}\n\n${content}`.trim()
+          if (key === "id") id = value
+          else if (key === "speaker") speakerName = value
+          else if (key === "topics")
+            metadata.topics = value.split(",").map((t) => t.trim())
+          else metadata[key] = value
         }
+      })
 
-        existing.metadata.topics = [
-          ...new Set([
-            ...(existing.metadata?.topics || []),
-
-            ...(entry.metadata?.topics || []),
-          ]),
-        ]
-      } else {
-        mergedBySpeaker.set(key, {
-          id: entry.id || crypto.randomUUID(),
-
-          speaker,
-
-          metadata: {
-            conference: entry.metadata?.conference || "",
-
-            date: entry.metadata?.date || "",
-
-            title: entry.metadata?.title || "",
-
-            role: entry.metadata?.role || "",
-
-            organization: entry.metadata?.organization || "",
-
-            topics: entry.metadata?.topics || [],
-          },
-
-          cleaned_content: entry.cleaned_content || "",
+      if (speakerName && content) {
+        finalData.push({
+          id: id,
+          speaker: speakerName,
+          metadata: metadata,
+          cleaned_content: content,
         })
       }
     }
 
-    const resultData = Array.from(mergedBySpeaker.values())
+    console.log("Transcription cleaning and parsing completed.")
 
-    console.log(`Final speakers: ${resultData.length}`)
-
-    // ------------------------------------------
-    // 6. RESPONSE
-    // ------------------------------------------
-
-    return res.json({
+    res.json({
       success: true,
-
-      fileName: `cleaned_transcription_${fileName || "transcription"}.json`,
-
-      speakers: resultData.length,
-
-      data: resultData,
+      fileName: `cleaned_transcription_${fileName}.json`,
+      data: finalData,
     })
   } catch (error) {
-    console.error("Error during the cleaning process:")
-
-    console.error(error)
-
-    return res.status(500).json({
-      success: false,
-
+    console.error("Error during the cleaning process:", error)
+    res.status(500).json({
       error: "An error occurred while cleaning the transcription.",
-
       details: error.message,
     })
   }
