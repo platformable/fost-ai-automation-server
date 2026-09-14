@@ -1648,7 +1648,7 @@ Title: [Matched Title]
 Speaker: [Matched Name]
 Role: [Matched Role]
 Organization: [Matched Org]
-Date: May 13, 2026
+Date: [Matched Date]
 Topics: [10-20 comma-separated tags]
 ===CONTENT_START===
 [FULL VERBATIM CLEANED TRANSCRIPT HERE]
