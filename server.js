@@ -1614,7 +1614,13 @@ app.post("/clean-transcription", async (req, res) => {
 CRITICAL DIRECTIVES:
 1. NEVER summarize, condense, paraphrase, or rewrite.
 2. Every spoken sentence must remain 100% complete in the final document.
-3. Your ONLY allowed edits are removing filler words (e.g., "um", "uh", "like") and fixing obvious transcription glitches.`,
+3. Your ONLY allowed edits are removing filler words (e.g., "um", "uh", "like", "yeah","mmm", "ah") and fixing obvious transcription glitches.
+
+STRICT FILTERING RULE:
+- The metadata sheet (${sheetDataString}) acts as an absolute WHITELIST.
+- ONLY include speakers who have a clear match in the sheet.
+- If a speaker in the transcript CANNOT be matched to any row in the sheet (e.g., audience members, uncredited MCs, side conversations, unknown voices), DO NOT create an entry for them. Completely ignore their spoken content.
+`,
       generationConfig: {
         temperature: 0.0,
       },
@@ -1632,6 +1638,11 @@ ${transcriptionText}
 1. Separate content by speaker, keeping chronological order.
 2. Clean the text verbatim (remove filler words/typos). DO NOT SUMMARIZE.
 3. Lookup the official speaker name, title, role, and organization from the Source of Truth.
+
+ METADATA LOOKUP & FILTERING (STRICT WHITELIST):
+- Cross-reference every speaker in the transcript against ${sheetDataString}.
+- IF THE SPEAKER IS IN THE SHEET: Match and standardize their official name, title, role, and organization.
+- IF THE SPEAKER IS NOT IN THE SHEET: DISCARD THEM ENTIRELY. Do not output any metadata, ID, or text content for them.
 
 ### OUTPUT FORMAT:
 You MUST output the result for each speaker using EXACTLY the following structure. Do not output JSON.
