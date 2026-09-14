@@ -1612,7 +1612,7 @@ app.post("/clean-transcription", async (req, res) => {
     console.log("Pass 1: Identifying speaker segments and boundaries...")
 
     const pass1Model = genAI.getGenerativeModel({
-      model: "gemini-3.1-flash-lite,
+      model: "gemini-3.1-flash-lite",
       generationConfig: {
         temperature: 0.0,
         responseMimeType: "application/json",
@@ -1637,13 +1637,19 @@ app.post("/clean-transcription", async (req, res) => {
                   },
                 },
               },
-              start_quote: { type: SchemaType.STRING, description: "First 8-10 words spoken by this speaker" },
-              end_quote: { type: SchemaType.STRING, description: "Last 8-10 words spoken by this speaker" }
+              start_quote: {
+                type: SchemaType.STRING,
+                description: "First 8-10 words spoken by this speaker",
+              },
+              end_quote: {
+                type: SchemaType.STRING,
+                description: "Last 8-10 words spoken by this speaker",
+              },
             },
-            required: ["id", "speaker", "metadata", "start_quote", "end_quote"]
-          }
-        }
-      }
+            required: ["id", "speaker", "metadata", "start_quote", "end_quote"],
+          },
+        },
+      },
     })
 
     const pass1Prompt = `
@@ -1661,7 +1667,9 @@ ${transcriptionText}
 
     const pass1Result = await pass1Model.generateContent(pass1Prompt)
     const speakerMap = JSON.parse(pass1Result.response.text())
-    console.log(`Pass 1 complete. Found ${speakerMap.length} valid speakers in sheet.`)
+    console.log(
+      `Pass 1 complete. Found ${speakerMap.length} valid speakers in sheet.`,
+    )
 
     // =========================================================================
     // PASS 2: Clean Each Speaker's Section Independently (Prevents Token Limit)
@@ -1671,13 +1679,15 @@ ${transcriptionText}
       systemInstruction: `You are a verbatim transcript editor. 
 Your ONLY task is to remove filler words ("um", "uh", "you know", "like") and fix obvious typos.
 NEVER summarize, condense, or delete any spoken sentences. Preserve 100% of the text.`,
-      generationConfig: { temperature: 0.0 }
+      generationConfig: { temperature: 0.0 },
     })
 
     const finalData = []
 
     for (const segment of speakerMap) {
-      console.log(`Pass 2: Extracting and cleaning transcript for ${segment.speaker}...`)
+      console.log(
+        `Pass 2: Extracting and cleaning transcript for ${segment.speaker}...`,
+      )
 
       // Slice out raw text segment using start_quote and end_quote
       const startIndex = transcriptionText.indexOf(segment.start_quote)
@@ -1685,7 +1695,10 @@ NEVER summarize, condense, or delete any spoken sentences. Preserve 100% of the 
 
       let rawSpeakerText = ""
       if (startIndex !== -1 && endIndex !== -1) {
-        rawSpeakerText = transcriptionText.substring(startIndex, endIndex + segment.end_quote.length)
+        rawSpeakerText = transcriptionText.substring(
+          startIndex,
+          endIndex + segment.end_quote.length,
+        )
       } else {
         // Fallback if exact quote matching fails
         rawSpeakerText = transcriptionText
@@ -1700,7 +1713,7 @@ NEVER summarize, condense, or delete any spoken sentences. Preserve 100% of the 
         id: segment.id,
         speaker: segment.speaker,
         metadata: segment.metadata,
-        cleaned_content: cleanedText
+        cleaned_content: cleanedText,
       })
     }
 
@@ -1711,7 +1724,6 @@ NEVER summarize, condense, or delete any spoken sentences. Preserve 100% of the 
       fileName: `cleaned_transcription_${fileName}.json`,
       data: finalData,
     })
-
   } catch (error) {
     console.error("Error during multi-pass cleaning:", error)
     res.status(500).json({
