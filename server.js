@@ -1638,6 +1638,11 @@ METADATA LOOKUP & FILTERING (STRICT WHITELIST):
 - IF THE SPEAKER IS IN THE SHEET: Match and standardize their official name, title, role, and organization.
 - IF THE SPEAKER IS NOT IN THE SHEET: DISCARD THEM ENTIRELY. Do not output any metadata, ID, or text content for them.
 
+CRITICAL BOUNDARY AND MATCHING RULES:
+1. The transcript does NOT have explicit speaker labels. You must look for MC introductions (e.g., "join me in welcoming Hugo", "we'll have Sanjana on stage", "welcome Alex Komlev on stage") to detect when a new speaker begins.
+2. FUZZY MATCHING: Speakers are often introduced by their first name only or with slight phonetic typos (e.g., "Michael Stipe" instead of "Michael Staib"). If a first name or phonetically similar name matches a record in the sheet, ACCEPT IT and use the official full name from the sheet.
+3. For each matched speaker, extract the exact FIRST 8-10 words they say (start_quote) and the exact LAST 8-10 words they say (end_quote) before the next speaker or MC takes over.
+
 ### OUTPUT FORMAT:
 You MUST output the result for each speaker using EXACTLY the following structure. Do not output JSON.
 
