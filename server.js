@@ -1596,126 +1596,124 @@ END REFERENCE DATA.
 // --------------------------------------------------
 
 app.post("/clean-transcription", async (req, res) => {
-  console.log("Cleaning transcription request received (Plain-Text Mode)")
+  console.log("Starting multi-pass transcript cleaning...")
   const { fileName, transcriptionText, sheetData } = req.body
 
   if (!sheetData) {
-    return res
-      .status(400)
-      .json({ error: "Missing sheetData in the request body." })
+    return res.status(400).json({ error: "Missing sheetData in request body." })
   }
 
   try {
     const sheetDataString = JSON.stringify(sheetData)
 
-    const model = genAI.getGenerativeModel({
-      model: "gemini-3.1-flash-lite",
-      systemInstruction: `You are a strict verbatim transcript editor.
-CRITICAL DIRECTIVES:
-1. NEVER summarize, condense, paraphrase, or rewrite.
-2. Every spoken sentence must remain 100% complete in the final document.
-3. Your ONLY allowed edits are removing filler words (e.g., "um", "uh", "like", "yeah","mmm", "ah") and fixing obvious transcription glitches.
+    // =========================================================================
+    // PASS 1: Identify Speaker Boundaries & Match Metadata
+    // =========================================================================
+    console.log("Pass 1: Identifying speaker segments and boundaries...")
 
-STRICT FILTERING RULE:
-- The metadata sheet (${sheetDataString}) acts as an absolute WHITELIST.
-- ONLY include speakers who have a clear match in the sheet.
-- If a speaker in the transcript CANNOT be matched to any row in the sheet (e.g., audience members, uncredited MCs, side conversations, unknown voices), DO NOT create an entry for them. Completely ignore their spoken content.
-`,
+    const pass1Model = genAI.getGenerativeModel({
+      model: "gemini-3.1-flash-lite,
       generationConfig: {
         temperature: 0.0,
-      },
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: SchemaType.ARRAY,
+          items: {
+            type: SchemaType.OBJECT,
+            properties: {
+              id: { type: SchemaType.STRING },
+              speaker: { type: SchemaType.STRING },
+              metadata: {
+                type: SchemaType.OBJECT,
+                properties: {
+                  conference: { type: SchemaType.STRING },
+                  date: { type: SchemaType.STRING },
+                  title: { type: SchemaType.STRING },
+                  role: { type: SchemaType.STRING },
+                  organization: { type: SchemaType.STRING },
+                  topics: {
+                    type: SchemaType.ARRAY,
+                    items: { type: SchemaType.STRING },
+                  },
+                },
+              },
+              start_quote: { type: SchemaType.STRING, description: "First 8-10 words spoken by this speaker" },
+              end_quote: { type: SchemaType.STRING, description: "Last 8-10 words spoken by this speaker" }
+            },
+            required: ["id", "speaker", "metadata", "start_quote", "end_quote"]
+          }
+        }
+      }
     })
 
-    const prompt = `
-Execute the following workflow on the transcript.
+    const pass1Prompt = `
+Analyze the transcript below and identify all speakers present in ${sheetDataString}.
 
-### INPUT DATA:
-- Metadata Source of Truth: ${sheetDataString}
-- Raw Transcript:
+RULES:
+1. ONLY include speakers that exist in ${sheetDataString}. Ignore unknown/unlisted speakers.
+2. For each speaker, extract the exact FIRST 8-10 words they say (start_quote) and the exact LAST 8-10 words they say (end_quote).
+3. Populate metadata from ${sheetDataString}.
+4. Set ID format sequentially starting at "talk-10-singapore26".
+
+TRANSCRIPT:
 ${transcriptionText}
-
-### INSTRUCTIONS:
-1. Separate content by speaker, keeping chronological order.
-2. Clean the text verbatim (remove filler words/typos). DO NOT SUMMARIZE.
-3. Lookup the official speaker name, title, role, and organization from the Source of Truth.
-
- METADATA LOOKUP & FILTERING (STRICT WHITELIST):
-- Cross-reference every speaker in the transcript against ${sheetDataString}.
-- IF THE SPEAKER IS IN THE SHEET: Match and standardize their official name, title, role, and organization.
-- IF THE SPEAKER IS NOT IN THE SHEET: DISCARD THEM ENTIRELY. Do not output any metadata, ID, or text content for them.
-
-### OUTPUT FORMAT:
-You MUST output the result for each speaker using EXACTLY the following structure. Do not output JSON.
-
-===START_SPEAKER===
-ID: [Generate sequential ID starting from talk-10-singapore26]
-Conference: Apidays Singapore 2026
-Title: [Matched Title]
-Speaker: [Matched Name]
-Role: [Matched Role]
-Organization: [Matched Org]
-Date: May 13, 2026
-Topics: [10-20 comma-separated tags]
-===CONTENT_START===
-[FULL VERBATIM CLEANED TRANSCRIPT HERE]
-===END_SPEAKER===
 `
 
-    const result = await model.generateContent(prompt)
-    const rawOutput = result.response.text()
+    const pass1Result = await pass1Model.generateContent(pass1Prompt)
+    const speakerMap = JSON.parse(pass1Result.response.text())
+    console.log(`Pass 1 complete. Found ${speakerMap.length} valid speakers in sheet.`)
+
+    // =========================================================================
+    // PASS 2: Clean Each Speaker's Section Independently (Prevents Token Limit)
+    // =========================================================================
+    const cleanerModel = genAI.getGenerativeModel({
+      model: "gemini-3.1-flash-lite",
+      systemInstruction: `You are a verbatim transcript editor. 
+Your ONLY task is to remove filler words ("um", "uh", "you know", "like") and fix obvious typos.
+NEVER summarize, condense, or delete any spoken sentences. Preserve 100% of the text.`,
+      generationConfig: { temperature: 0.0 }
+    })
 
     const finalData = []
-    const speakerBlocks = rawOutput
-      .split("===START_SPEAKER===")
-      .filter((b) => b.trim())
 
-    for (const block of speakerBlocks) {
-      const endCleaned = block.split("===END_SPEAKER===")[0].trim()
-      const parts = endCleaned.split("===CONTENT_START===")
-      if (parts.length < 2) continue
+    for (const segment of speakerMap) {
+      console.log(`Pass 2: Extracting and cleaning transcript for ${segment.speaker}...`)
 
-      const headerPart = parts[0].trim()
-      const content = parts.slice(1).join("===CONTENT_START===").trim()
+      // Slice out raw text segment using start_quote and end_quote
+      const startIndex = transcriptionText.indexOf(segment.start_quote)
+      const endIndex = transcriptionText.indexOf(segment.end_quote)
 
-      const headerLines = headerPart.split("\n")
-
-      const metadata = {}
-      let id = "",
-        speakerName = ""
-
-      headerLines.forEach((line) => {
-        const match = line.match(/^([^:]+):\s*(.*)$/)
-        if (match) {
-          const key = match[1].trim().toLowerCase()
-          const value = match[2].trim()
-
-          if (key === "id") id = value
-          else if (key === "speaker") speakerName = value
-          else if (key === "topics")
-            metadata.topics = value.split(",").map((t) => t.trim())
-          else metadata[key] = value
-        }
-      })
-
-      if (speakerName && content) {
-        finalData.push({
-          id: id,
-          speaker: speakerName,
-          metadata: metadata,
-          cleaned_content: content,
-        })
+      let rawSpeakerText = ""
+      if (startIndex !== -1 && endIndex !== -1) {
+        rawSpeakerText = transcriptionText.substring(startIndex, endIndex + segment.end_quote.length)
+      } else {
+        // Fallback if exact quote matching fails
+        rawSpeakerText = transcriptionText
       }
+
+      // Individual API call per speaker guarantees full verbatim output budget
+      const cleanPrompt = `Clean the following transcript verbatim. Do NOT summarize or shorten:\n\n${rawSpeakerText}`
+      const cleanResult = await cleanerModel.generateContent(cleanPrompt)
+      const cleanedText = cleanResult.response.text().trim()
+
+      finalData.push({
+        id: segment.id,
+        speaker: segment.speaker,
+        metadata: segment.metadata,
+        cleaned_content: cleanedText
+      })
     }
 
-    console.log("Transcription cleaning and parsing completed.")
+    console.log("All speakers processed successfully.")
 
     res.json({
       success: true,
       fileName: `cleaned_transcription_${fileName}.json`,
       data: finalData,
     })
+
   } catch (error) {
-    console.error("Error during the cleaning process:", error)
+    console.error("Error during multi-pass cleaning:", error)
     res.status(500).json({
       error: "An error occurred while cleaning the transcription.",
       details: error.message,
