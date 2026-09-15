@@ -1616,7 +1616,7 @@ app.post("/clean-transcription", async (req, res) => {
     console.log("Paso 1: Identificando segmentos de oradores y metadatos...")
 
     const pass1Model = genAI.getGenerativeModel({
-      model: "gemini-3.5-flash-lite-lite", // Pro es mejor para razonamiento complejo y fuzzy matching
+      model: "gemini-3.5-flash-lite", // Pro es mejor para razonamiento complejo y fuzzy matching
       generationConfig: {
         temperature: 0.0,
         responseMimeType: "application/json",
