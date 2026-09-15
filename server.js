@@ -1667,7 +1667,7 @@ CRITICAL BOUNDARY AND MATCHING RULES:
 3. MISSING LABELS: The transcript lacks explicit speaker labels. You must actively look for MC introductions (e.g., "Next up we've got...", "We are going to hear from...", "welcome Alex Komlev") to find where a new speaker begins.
 4. STRICT WHITELIST: If a speaker absolutely cannot be matched to the sheet data, IGNORE THEM.
 5. EXTRACTION: For each matched speaker, extract the exact FIRST 8-10 words they say (start_quote) and the exact LAST 8-10 words they say (end_quote).
-6. ID FORMAT: Set ID sequentially starting at "talk-10-singapore26". Date MUST be "May 13, 2026" and Conference "Apidays Singapore 2026".
+6. ID FORMAT: Set ID sequentially starting at "talk-10-singapore26". Date [based on the actual date of the talk, use ${sheetDataString}] and Conference "Apidays Singapore 2026".
 
 TRANSCRIPT:
 ${transcriptionText}
