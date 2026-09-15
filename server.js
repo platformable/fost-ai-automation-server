@@ -1616,7 +1616,7 @@ app.post("/clean-transcription", async (req, res) => {
     console.log("Paso 1: Identificando segmentos de oradores y metadatos...")
 
     const pass1Model = genAI.getGenerativeModel({
-      model: "gemini-3.5-flash", // Pro es mejor para razonamiento complejo y fuzzy matching
+      model: "gemini-3.5-flash-lite-lite", // Pro es mejor para razonamiento complejo y fuzzy matching
       generationConfig: {
         temperature: 0.0,
         responseMimeType: "application/json",
@@ -1683,7 +1683,7 @@ ${transcriptionText}
     // PASO 2: Limpiar el texto de cada orador de forma individual (Previene límite de tokens)
     // =========================================================================
     const cleanerModel = genAI.getGenerativeModel({
-      model: "gemini-3.5-flash",
+      model: "gemini-3.5-flash-lite",
       systemInstruction: `You are a strict verbatim transcript editor.
 CRITICAL DIRECTIVES:
 1. NEVER summarize, condense, paraphrase, or rewrite.
