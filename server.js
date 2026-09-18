@@ -1716,7 +1716,7 @@ ${transcriptionText}
     // PASO 2: Limpiar el texto de cada orador (Previene límite de tokens)
     // =========================================================================
     const cleanerModel = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
+      model: "gemini-3.5-flash-lite",
       systemInstruction: `You are a strict verbatim transcript editor.
 CRITICAL DIRECTIVES:
 1. NEVER summarize, condense, paraphrase, or rewrite.
