@@ -1599,6 +1599,38 @@ END REFERENCE DATA.
 // CLEAN TRANSCRIPTION ENDPOINT (2-PASS ARCHITECTURE)
 // --------------------------------------------------
 
+// --------------------------------------------------
+// FUNCIONES AUXILIARES PARA BÚSQUEDA DIFUSA
+// --------------------------------------------------
+function findFuzzyIndex(fullText, quote, searchFromIndex = 0) {
+  if (!quote) return -1
+
+  const cleanQuote = quote.toLowerCase().replace(/[^a-z0-9]/gi, "")
+  if (cleanQuote.length < 10) return -1
+
+  let cleanText = ""
+  const indexMap = []
+
+  for (let i = searchFromIndex; i < fullText.length; i++) {
+    const char = fullText[i]
+    if (/[a-z0-9]/i.test(char)) {
+      cleanText += char.toLowerCase()
+      indexMap.push(i)
+    }
+  }
+
+  const cleanIndex = cleanText.indexOf(cleanQuote)
+  if (cleanIndex !== -1) {
+    return indexMap[cleanIndex]
+  }
+
+  return -1
+}
+
+// --------------------------------------------------
+// CLEAN TRANSCRIPTION ENDPOINT (2-PASS ARCHITECTURE)
+// --------------------------------------------------
+
 app.post("/clean-transcription", async (req, res) => {
   console.log("Iniciando limpieza de transcripción multipaso...")
   const { fileName, transcriptionText, sheetData } = req.body
@@ -1616,7 +1648,7 @@ app.post("/clean-transcription", async (req, res) => {
     console.log("Paso 1: Identificando segmentos de oradores y metadatos...")
 
     const pass1Model = genAI.getGenerativeModel({
-      model: "gemini-3.5-flash-lite", // Pro es mejor para razonamiento complejo y fuzzy matching
+      model: "gemini-3.5-flash-lite",
       generationConfig: {
         temperature: 0.0,
         responseMimeType: "application/json",
@@ -1644,12 +1676,12 @@ app.post("/clean-transcription", async (req, res) => {
               start_quote: {
                 type: SchemaType.STRING,
                 description:
-                  "Primeras 8-10 palabras exactas dichas por el orador",
+                  "Primeras 15 palabras exactas dichas por el orador",
               },
               end_quote: {
                 type: SchemaType.STRING,
                 description:
-                  "Últimas 8-10 palabras exactas dichas por el orador antes de que hable el siguiente",
+                  "Últimas 15 palabras exactas dichas por el orador antes de que hable el siguiente",
               },
             },
             required: ["id", "speaker", "metadata", "start_quote", "end_quote"],
@@ -1662,12 +1694,12 @@ app.post("/clean-transcription", async (req, res) => {
 Analyze the transcript below and identify all speakers present in the provided sheet data: ${sheetDataString}.
 
 CRITICAL BOUNDARY AND MATCHING RULES:
-1. FUZZY MATCHING & TYPOS: The transcript software makes extreme phonetic errors (e.g., transcribing "Derric Gilling" as "Derek Zeeling"). Be highly aggressive in fuzzy matching. If a name sounds phonetically similar to a sheet entry, ACCEPT IT.
-2. COMPANY/ROLE MATCHING: Speakers are often introduced by their first name and company only (e.g., "My name is Ram. I am from Boomi" or "Nabila from Exec on AI"). If a first name + organization matches a row in the sheet, ACCEPT IT and use the full official name.
-3. MISSING LABELS: The transcript lacks explicit speaker labels. You must actively look for MC introductions (e.g., "Next up we've got...", "We are going to hear from...", "welcome Alex Komlev") to find where a new speaker begins.
+1. FUZZY MATCHING & TYPOS: The transcript software makes extreme phonetic errors. Be highly aggressive in fuzzy matching. If a name sounds phonetically similar to a sheet entry, ACCEPT IT.
+2. COMPANY/ROLE MATCHING: Speakers are often introduced by their first name and company only. If a first name + organization matches a row in the sheet, ACCEPT IT and use the full official name.
+3. MISSING LABELS: The transcript lacks explicit speaker labels. You must actively look for MC introductions to find where a new speaker begins.
 4. STRICT WHITELIST: If a speaker absolutely cannot be matched to the sheet data, IGNORE THEM.
-5. EXTRACTION: For each matched speaker, extract the exact FIRST 8-10 words they say (start_quote) and the exact LAST 8-10 words they say (end_quote).
-6. ID FORMAT: Set ID sequentially starting at "talk-10-singapore26". Date [based on the actual date of the talk, use ${sheetDataString}] and Conference use ${sheetDataString} title without the word "Program" and without "FOST", should be "Apidays ${sheetDataString} title + 2026".
+5. EXTRACTION: For each matched speaker, extract the exact FIRST 15 words they say (start_quote) and the exact LAST 15 words they say (end_quote).
+6. ID FORMAT: Set ID sequentially starting at "talk-10-munich26". Date [based on the actual date of the talk, use ${sheetDataString}] and Conference use ${sheetDataString} title without the word "Program" and without "FOST", should be "Apidays ${sheetDataString} title and "2026"".
 7. DATE FORMAT: Date must use this format "July 1, 2026"
 
 TRANSCRIPT:
@@ -1677,14 +1709,14 @@ ${transcriptionText}
     const pass1Result = await pass1Model.generateContent(pass1Prompt)
     const speakerMap = JSON.parse(pass1Result.response.text())
     console.log(
-      `Paso 1 completado. Se encontraron ${speakerMap.length} oradores válidos en la hoja.`,
+      `Paso 1 completado. Se encontraron ${speakerMap.length} oradores válidos.`,
     )
 
     // =========================================================================
-    // PASO 2: Limpiar el texto de cada orador de forma individual (Previene límite de tokens)
+    // PASO 2: Limpiar el texto de cada orador (Previene límite de tokens)
     // =========================================================================
     const cleanerModel = genAI.getGenerativeModel({
-      model: "gemini-3.5-flash-lite",
+      model: "gemini-2.5-flash",
       systemInstruction: `You are a strict verbatim transcript editor.
 CRITICAL DIRECTIVES:
 1. NEVER summarize, condense, paraphrase, or rewrite.
@@ -1694,36 +1726,65 @@ CRITICAL DIRECTIVES:
     })
 
     const finalData = []
+    let idCounter = 10 // Forzamos IDs únicos desde el código
 
     for (const segment of speakerMap) {
-      console.log(
-        `Paso 2: Extrayendo y limpiando transcripción para ${segment.speaker}...`,
+      console.log(`\n--- Procesando orador: ${segment.speaker} ---`)
+
+      const uniqueId = `talk-${idCounter++}-munich26`
+
+      const startIndex = findFuzzyIndex(
+        transcriptionText,
+        segment.start_quote,
+        0,
+      )
+      const safeStartIndex = startIndex !== -1 ? startIndex : 0
+      const endIndex = findFuzzyIndex(
+        transcriptionText,
+        segment.end_quote,
+        safeStartIndex,
       )
 
-      // Extraer el segmento de texto crudo usando start_quote y end_quote
-      const startIndex = transcriptionText.indexOf(segment.start_quote)
-      const endIndex = transcriptionText.indexOf(segment.end_quote)
-
       let rawSpeakerText = ""
+
       if (startIndex !== -1 && endIndex !== -1 && startIndex < endIndex) {
         rawSpeakerText = transcriptionText.substring(
           startIndex,
-          endIndex + segment.end_quote.length,
+          endIndex + segment.end_quote.length + 100,
+        )
+        console.log(
+          `[Éxito] Texto extraído por comillas. Longitud: ${rawSpeakerText.length} caracteres.`,
+        )
+      } else if (startIndex !== -1) {
+        console.warn(
+          `[Aviso] Solo se encontró el inicio para ${segment.speaker}. Aplicando fallback parcial.`,
+        )
+        rawSpeakerText = transcriptionText.substring(
+          startIndex,
+          startIndex + 15000,
         )
       } else {
-        // Fallback: Si Gemini falló encontrando la cita exacta, busca solo el inicio
         console.warn(
-          `Advertencia: No se encontraron los límites exactos para ${segment.speaker}. Aplicando fallback.`,
+          `[Aviso] Límites no encontrados para ${segment.speaker}. Aplicando fallback por nombre.`,
         )
-        rawSpeakerText =
-          startIndex !== -1
-            ? transcriptionText.substring(startIndex, startIndex + 15000)
-            : "(Error extrayendo texto del orador)"
+        const nameIndex = transcriptionText.indexOf(
+          segment.speaker.split(" ")[0],
+        )
+        if (nameIndex !== -1) {
+          rawSpeakerText = transcriptionText.substring(
+            nameIndex,
+            nameIndex + 15000,
+          )
+        }
       }
 
-      if (rawSpeakerText.length < 50) continue // Ignorar si el texto es inválido o muy corto
+      if (rawSpeakerText.length < 50) {
+        console.error(
+          `[Error] El texto para ${segment.speaker} es muy corto o nulo. Ignorando.`,
+        )
+        continue
+      }
 
-      // Llamada individual a la API por orador para garantizar que el límite de tokens alcance para el texto verbatim
       const cleanPrompt = `Clean the following transcript verbatim. Do NOT summarize or shorten:\n\n${rawSpeakerText}`
 
       try {
@@ -1731,20 +1792,21 @@ CRITICAL DIRECTIVES:
         const cleanedText = cleanResult.response.text().trim()
 
         finalData.push({
-          id: segment.id,
+          id: uniqueId,
           speaker: segment.speaker,
           metadata: segment.metadata,
           cleaned_content: cleanedText,
         })
+        console.log(`[Éxito] Orador ${segment.speaker} añadido correctamente.`)
       } catch (err) {
         console.error(
-          `Error limpiando texto para ${segment.speaker}:`,
+          `[Error] Falló la API para ${segment.speaker}:`,
           err.message,
         )
       }
     }
 
-    console.log("Limpieza de transcripción y parseo completados con éxito.")
+    console.log("\nLimpieza de transcripción completada con éxito.")
 
     res.json({
       success: true,
