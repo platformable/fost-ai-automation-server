@@ -1600,11 +1600,10 @@ END REFERENCE DATA.
 // --------------------------------------------------
 
 // --------------------------------------------------
-// FUNCIONES AUXILIARES PARA BÚSQUEDA DIFUSA
+// FUNCIONES AUXILIARES
 // --------------------------------------------------
 function findFuzzyIndex(fullText, quote, searchFromIndex = 0) {
   if (!quote) return -1
-
   const cleanQuote = quote.toLowerCase().replace(/[^a-z0-9]/gi, "")
   if (cleanQuote.length < 10) return -1
 
@@ -1623,8 +1622,45 @@ function findFuzzyIndex(fullText, quote, searchFromIndex = 0) {
   if (cleanIndex !== -1) {
     return indexMap[cleanIndex]
   }
-
   return -1
+}
+
+// NUEVA FUNCIÓN: Limpia textos gigantes dividiéndolos en fragmentos seguros
+async function cleanTextInChunks(text, model) {
+  const MAX_CHARS = 20000 // Límite seguro para no chocar con los 8192 tokens de Gemini
+  let cleanedFullText = ""
+
+  let start = 0
+  let chunkIndex = 1
+
+  while (start < text.length) {
+    let end = start + MAX_CHARS
+    if (end < text.length) {
+      // Evitar cortar palabras a la mitad: buscar el último espacio
+      const lastSpace = text.lastIndexOf(" ", end)
+      if (lastSpace > start) end = lastSpace
+    }
+
+    const chunk = text.substring(start, end)
+    console.log(
+      `     -> Limpiando fragmento ${chunkIndex}... (${chunk.length} caracteres)`,
+    )
+
+    const cleanPrompt = `Clean the following transcript verbatim. Do NOT summarize or shorten. Fix typos and remove filler words:\n\n${chunk}`
+
+    try {
+      const result = await model.generateContent(cleanPrompt)
+      cleanedFullText += result.response.text().trim() + " "
+    } catch (e) {
+      console.error(`     [Error en fragmento ${chunkIndex}]:`, e.message)
+      // Fallback a prueba de balas: si falla la red, guardamos el texto crudo para NO perder al orador
+      cleanedFullText += chunk.trim() + " "
+    }
+
+    start = end
+    chunkIndex++
+  }
+  return cleanedFullText.trim()
 }
 
 // --------------------------------------------------
@@ -1643,7 +1679,7 @@ app.post("/clean-transcription", async (req, res) => {
     const sheetDataString = JSON.stringify(sheetData)
 
     // =========================================================================
-    // PASO 1: Identificar Límites de los Oradores y Metadatos (Modo JSON)
+    // PASO 1: Identificar Límites
     // =========================================================================
     console.log("Paso 1: Identificando segmentos de oradores y metadatos...")
 
@@ -1675,13 +1711,11 @@ app.post("/clean-transcription", async (req, res) => {
               },
               start_quote: {
                 type: SchemaType.STRING,
-                description:
-                  "Primeras 15 palabras exactas dichas por el orador",
+                description: "Primeras 15 palabras",
               },
               end_quote: {
                 type: SchemaType.STRING,
-                description:
-                  "Últimas 15 palabras exactas dichas por el orador antes de que hable el siguiente",
+                description: "Últimas 15 palabras",
               },
             },
             required: ["id", "speaker", "metadata", "start_quote", "end_quote"],
@@ -1693,19 +1727,16 @@ app.post("/clean-transcription", async (req, res) => {
     const pass1Prompt = `
 Analyze the transcript below and identify all speakers present in the provided sheet data: ${sheetDataString}.
 
-CRITICAL BOUNDARY AND MATCHING RULES:
-1. FUZZY MATCHING & TYPOS: The transcript software makes extreme phonetic errors. Be highly aggressive in fuzzy matching. If a name sounds phonetically similar to a sheet entry, ACCEPT IT.
-2. COMPANY/ROLE MATCHING: Speakers are often introduced by their first name and company only. If a first name + organization matches a row in the sheet, ACCEPT IT and use the full official name.
-3. MISSING LABELS: The transcript lacks explicit speaker labels. You must actively look for MC introductions to find where a new speaker begins.
-4. STRICT WHITELIST: If a speaker absolutely cannot be matched to the sheet data, IGNORE THEM.
-5. EXTRACTION: For each matched speaker, extract the exact FIRST 15 words they say (start_quote) and the exact LAST 15 words they say (end_quote).
-6. ID FORMAT: Set ID sequentially starting at "talk-10-munich26". Date [based on the actual date of the talk, use ${sheetDataString}] and Conference use ${sheetDataString} title without the word "Program" and without "FOST", should be "Apidays ${sheetDataString} title and "2026"".
-7. DATE FORMAT: Date must use this format "July 1, 2026"
+CRITICAL RULES:
+1. FUZZY MATCHING: The transcript makes phonetic errors. Be highly aggressive in matching.
+2. COMPANY/ROLE MATCHING: If a first name + organization matches the sheet, ACCEPT IT.
+3. MISSING LABELS: Look for MC introductions to find where a speaker begins.
+4. EXTRACTION: Extract exact FIRST 15 words (start_quote) and LAST 15 words (end_quote).
+5. ID FORMAT: "talk-10-munich26" sequentially. Date MUST be "July 1, 2026". Conference "Apidays ${sheetDataString} title 2026" (without "FOST" or "Program").
 
 TRANSCRIPT:
 ${transcriptionText}
 `
-
     const pass1Result = await pass1Model.generateContent(pass1Prompt)
     const speakerMap = JSON.parse(pass1Result.response.text())
     console.log(
@@ -1713,31 +1744,38 @@ ${transcriptionText}
     )
 
     // =========================================================================
-    // PASO 2: Limpiar el texto de cada orador (Previene límite de tokens)
+    // PASO 2: Limpieza Verbatim por Chunks (Evita Límite de Tokens)
     // =========================================================================
     const cleanerModel = genAI.getGenerativeModel({
       model: "gemini-3.5-flash-lite",
       systemInstruction: `You are a strict verbatim transcript editor.
 CRITICAL DIRECTIVES:
 1. NEVER summarize, condense, paraphrase, or rewrite.
-2. Every spoken sentence must remain 100% complete in the final document.
-3. Your ONLY allowed edits are removing filler words (e.g., "um", "uh", "like", "yeah", "so", "actually", "right", "you know") and fixing obvious transcription glitches.`,
+2. Every spoken sentence must remain 100% complete.
+3. Your ONLY allowed edits are removing filler words (e.g., "um", "uh", "like") and fixing obvious transcription glitches.`,
       generationConfig: { temperature: 0.0 },
     })
 
     const finalData = []
-    let idCounter = 10 // Forzamos IDs únicos desde el código
+    let idCounter = 10
 
+    // Pre-calcular posiciones iniciales para permitir el "Fallback Inteligente"
     for (const segment of speakerMap) {
-      console.log(`\n--- Procesando orador: ${segment.speaker} ---`)
-
-      const uniqueId = `talk-${idCounter++}-munich26`
-
-      const startIndex = findFuzzyIndex(
+      segment.startIndex = findFuzzyIndex(
         transcriptionText,
         segment.start_quote,
         0,
       )
+    }
+    // Ordenamos a los oradores cronológicamente según aparecen en el texto
+    speakerMap.sort((a, b) => a.startIndex - b.startIndex)
+
+    for (let i = 0; i < speakerMap.length; i++) {
+      const segment = speakerMap[i]
+      console.log(`\n--- Procesando orador: ${segment.speaker} ---`)
+
+      const uniqueId = `talk-${idCounter++}-munich26`
+      const startIndex = segment.startIndex
       const safeStartIndex = startIndex !== -1 ? startIndex : 0
       const endIndex = findFuzzyIndex(
         transcriptionText,
@@ -1756,54 +1794,37 @@ CRITICAL DIRECTIVES:
           `[Éxito] Texto extraído por comillas. Longitud: ${rawSpeakerText.length} caracteres.`,
         )
       } else if (startIndex !== -1) {
+        // FALLBACK INTELIGENTE: Corta el texto justo donde empieza el SIGUIENTE orador
+        const nextSegment = speakerMap[i + 1]
+        let nextStart = nextSegment
+          ? nextSegment.startIndex
+          : transcriptionText.length
+        if (nextStart === -1 || nextStart <= startIndex)
+          nextStart = transcriptionText.length
+
+        rawSpeakerText = transcriptionText.substring(startIndex, nextStart)
         console.warn(
-          `[Aviso] Solo se encontró el inicio para ${segment.speaker}. Aplicando fallback parcial.`,
-        )
-        rawSpeakerText = transcriptionText.substring(
-          startIndex,
-          startIndex + 15000,
+          `[Aviso] Final no encontrado. Extrayendo hasta el próximo orador. Longitud: ${rawSpeakerText.length} caracteres.`,
         )
       } else {
         console.warn(
-          `[Aviso] Límites no encontrados para ${segment.speaker}. Aplicando fallback por nombre.`,
-        )
-        const nameIndex = transcriptionText.indexOf(
-          segment.speaker.split(" ")[0],
-        )
-        if (nameIndex !== -1) {
-          rawSpeakerText = transcriptionText.substring(
-            nameIndex,
-            nameIndex + 15000,
-          )
-        }
-      }
-
-      if (rawSpeakerText.length < 50) {
-        console.error(
-          `[Error] El texto para ${segment.speaker} es muy corto o nulo. Ignorando.`,
+          `[Aviso] Límites no encontrados para ${segment.speaker}. Saltando orador.`,
         )
         continue
       }
 
-      const cleanPrompt = `Clean the following transcript verbatim. Do NOT summarize or shorten:\n\n${rawSpeakerText}`
+      if (rawSpeakerText.length < 50) continue
 
-      try {
-        const cleanResult = await cleanerModel.generateContent(cleanPrompt)
-        const cleanedText = cleanResult.response.text().trim()
+      // Limpieza protegida contra límites de tokens usando Chunks
+      const cleanedText = await cleanTextInChunks(rawSpeakerText, cleanerModel)
 
-        finalData.push({
-          id: uniqueId,
-          speaker: segment.speaker,
-          metadata: segment.metadata,
-          cleaned_content: cleanedText,
-        })
-        console.log(`[Éxito] Orador ${segment.speaker} añadido correctamente.`)
-      } catch (err) {
-        console.error(
-          `[Error] Falló la API para ${segment.speaker}:`,
-          err.message,
-        )
-      }
+      finalData.push({
+        id: uniqueId,
+        speaker: segment.speaker,
+        metadata: segment.metadata,
+        cleaned_content: cleanedText,
+      })
+      console.log(`[Éxito] Orador ${segment.speaker} procesado y guardado.`)
     }
 
     console.log("\nLimpieza de transcripción completada con éxito.")
