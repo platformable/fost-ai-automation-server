@@ -2,17 +2,12 @@ const express = require("express")
 const multer = require("multer")
 const fs = require("fs")
 const path = require("path")
-const crypto = require("crypto")
-const { execFile } = require("child_process")
 const { promisify } = require("util")
 
 require("dotenv").config()
 
 const { Agent, setGlobalDispatcher } = require("undici")
-
 const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai")
-
-const { GoogleAIFileManager } = require("@google/generative-ai/server")
 
 // --------------------------------------------------
 // CONFIG
@@ -46,45 +41,17 @@ const upload = multer({
   dest: "uploads/",
 })
 
-const execFileAsync = promisify(execFile)
-
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 
-const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY)
-
 // --------------------------------------------------
-// TRANSCRIPTION CONFIG
+// CONSTANTS
 // --------------------------------------------------
 
-// Duración aproximada de cada chunk.
-// 9 horas ≈ 36 chunks.
-const CHUNK_DURATION = 5 * 60
-
-// Número de chunks procesados simultáneamente.
-const MAX_CONCURRENCY = 3
-
-// Intentos normales.
-const MAX_RETRIES = 3
+// Chunks más pequeños: 30KB en lugar de 100KB
+const STEP1_CHUNK = 30000
 
 // --------------------------------------------------
-// SILENCE CONFIG
-// --------------------------------------------------
-
-// Silencios de esta duración o mayores serán
-// eliminados/reducidos durante el preprocesamiento.
-//
-// 2.5 segundos permite conservar pausas naturales
-// mientras elimina silencios largos.
-const SILENCE_DURATION = 2.5
-
-// Nivel de silencio.
-// -35dB funciona razonablemente bien para conferencias.
-// Si el audio tiene mucho ruido de fondo podemos
-// bajarlo a -30dB.
-const SILENCE_THRESHOLD = "-35dB"
-
-// --------------------------------------------------
-// UTILS
+// UTILITY FUNCTIONS
 // --------------------------------------------------
 
 function sleep(ms) {
@@ -93,1539 +60,90 @@ function sleep(ms) {
   })
 }
 
-function ensureDirectory(directory) {
-  fs.mkdirSync(directory, {
-    recursive: true,
-  })
-}
-
-function removeDirectory(directory) {
-  if (fs.existsSync(directory)) {
-    fs.rmSync(directory, {
-      recursive: true,
-      force: true,
-    })
-  }
-}
-
 // --------------------------------------------------
-// DETECT / REMOVE LONG SILENCES
+// IMPROVED FUZZY INDEX SEARCH (Cambio 1)
 // --------------------------------------------------
 
-async function cleanAudio(inputPath, outputPath) {
-  console.log("")
-  console.log("Limpiando silencios largos con FFmpeg...")
-
-  const silenceFilter =
-    "silenceremove=start_periods=1:start_duration=0.3:start_threshold=-35dB:stop_periods=-1:stop_duration=2.5:stop_threshold=-35dB:stop_silence=0.4"
-
-  console.log("FFmpeg filter:")
-  console.log(silenceFilter)
-
-  await execFileAsync("ffmpeg", [
-    "-hide_banner",
-    "-loglevel",
-    "error",
-
-    "-i",
-    inputPath,
-
-    "-ac",
-    "1",
-
-    "-ar",
-    "16000",
-
-    "-af",
-    silenceFilter,
-
-    "-c:a",
-    "libmp3lame",
-
-    "-b:a",
-    "64k",
-
-    "-y",
-
-    outputPath,
-  ])
-
-  console.log("Audio limpio generado:", outputPath)
-
-  return outputPath
-}
-// --------------------------------------------------
-// SPLIT AUDIO
-// --------------------------------------------------
-
-async function splitAudio(inputPath, outputDirectory) {
-  ensureDirectory(outputDirectory)
-
-  console.log("")
-  console.log("Dividiendo audio limpio con FFmpeg...")
-
-  const cleanedAudioPath = path.join(outputDirectory, "audio_cleaned.mp3")
-
-  // ------------------------------------------
-  // 1. CLEAN AUDIO
-  // ------------------------------------------
-
-  await cleanAudio(inputPath, cleanedAudioPath)
-
-  // ------------------------------------------
-  // 2. SPLIT AUDIO
-  // ------------------------------------------
-
-  await execFileAsync("ffmpeg", [
-    "-hide_banner",
-    "-loglevel",
-    "error",
-
-    "-i",
-    cleanedAudioPath,
-
-    "-f",
-    "segment",
-
-    "-segment_time",
-    String(CHUNK_DURATION),
-
-    "-segment_start_number",
-    "0",
-
-    // IMPORTANTE:
-    // Cada chunk se codifica como un archivo
-    // independiente.
-    "-c:a",
-    "libmp3lame",
-
-    "-b:a",
-    "64k",
-
-    "-ar",
-    "16000",
-
-    "-ac",
-    "1",
-
-    "-y",
-
-    path.join(outputDirectory, "chunk_%03d.mp3"),
-  ])
-
-  // ------------------------------------------
-  // 3. FIND ACTUAL CHUNKS
-  // ------------------------------------------
-
-  const chunks = fs
-    .readdirSync(outputDirectory)
-    .filter((file) => /^chunk_\d+\.mp3$/.test(file))
-    .sort((a, b) => {
-      const aNumber = parseInt(a.match(/\d+/)[0], 10)
-
-      const bNumber = parseInt(b.match(/\d+/)[0], 10)
-
-      return aNumber - bNumber
-    })
-    .map((file) => path.join(outputDirectory, file))
-
-  // ------------------------------------------
-  // 4. VERIFY FILES
-  // ------------------------------------------
-
-  console.log("")
-  console.log(`FFmpeg generó ${chunks.length} chunks.`)
-
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i]
-
-    const stats = fs.statSync(chunk)
-
-    console.log(
-      `[Chunk ${i}] ${path.basename(chunk)} - ${(
-        stats.size /
-        1024 /
-        1024
-      ).toFixed(2)} MB`,
-    )
-
-    if (stats.size === 0) {
-      throw new Error(`Chunk vacío: ${chunk}`)
-    }
-  }
-
-  if (chunks.length === 0) {
-    throw new Error("FFmpeg no generó ningún chunk.")
-  }
-
-  return chunks
-}
-
-// --------------------------------------------------
-// UPLOAD TO GEMINI
-// --------------------------------------------------
-
-async function uploadToGemini(filePath, chunkNumber) {
-  // ------------------------------------------
-  // VERIFY LOCAL FILE
-  // ------------------------------------------
-
-  if (!fs.existsSync(filePath)) {
-    throw new Error(
-      `El archivo del chunk ${chunkNumber} no existe: ${filePath}`,
-    )
-  }
-
-  const stats = fs.statSync(filePath)
-
-  if (stats.size === 0) {
-    throw new Error(
-      `El archivo del chunk ${chunkNumber} está vacío: ${filePath}`,
-    )
-  }
-
-  console.log(`[Chunk ${chunkNumber}] Subiendo a Gemini...`)
-
-  const response = await fileManager.uploadFile(filePath, {
-    mimeType: "audio/mpeg",
-
-    displayName: `conference_chunk_${String(chunkNumber).padStart(3, "0")}.mp3`,
-  })
-
-  let fileState = response.file
-
-  while (fileState.state === "PROCESSING") {
-    console.log(`[Chunk ${chunkNumber}] Gemini procesando archivo...`)
-
-    await sleep(5000)
-
-    fileState = await fileManager.getFile(response.file.name)
-  }
-
-  if (fileState.state === "FAILED") {
-    throw new Error(`Gemini no pudo procesar el chunk ${chunkNumber}`)
-  }
-
-  return fileState
-}
-
-// --------------------------------------------------
-// REPETITION DETECTION
-// --------------------------------------------------
-
-// --------------------------------------------------
-// REPETITION DETECTION
-// --------------------------------------------------
-
-function detectSuspiciousRepetition(text) {
-  if (!text) {
-    return false
-  }
-
-  // ------------------------------------------
-  // NORMALIZE
-  // ------------------------------------------
-
-  const normalized = text
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-
-  const words = normalized.split(" ").filter(Boolean)
-
-  if (words.length < 80) {
-    return false
-  }
-
-  // ------------------------------------------
-  // 1. SAME WORD REPEATED MANY TIMES
-  //
-  // Ej:
-  // "the the the the the the..."
-  // ------------------------------------------
-
-  let consecutiveWords = 1
-  let maxConsecutiveWords = 1
-
-  for (let i = 1; i < words.length; i++) {
-    if (words[i] === words[i - 1]) {
-      consecutiveWords++
-
-      if (consecutiveWords > maxConsecutiveWords) {
-        maxConsecutiveWords = consecutiveWords
-      }
-    } else {
-      consecutiveWords = 1
-    }
-  }
-
-  if (maxConsecutiveWords >= 8) {
-    console.warn(
-      `⚠️ Repetición de palabra detectada: ${maxConsecutiveWords} veces consecutivas.`,
-    )
-
-    return true
-  }
-
-  // ------------------------------------------
-  // 2. REPEATED PHRASES
-  //
-  // Busca frases de diferentes tamaños.
-  //
-  // Ej:
-  // "three months in Tahoe"
-  // repetido decenas de veces.
-  // ------------------------------------------
-
-  const phraseSizes = [3, 4, 5, 6, 8, 10]
-
-  for (const phraseSize of phraseSizes) {
-    const occurrences = new Map()
-
-    for (let i = 0; i <= words.length - phraseSize; i++) {
-      const phrase = words.slice(i, i + phraseSize).join(" ")
-
-      const positions = occurrences.get(phrase) || []
-
-      positions.push(i)
-
-      occurrences.set(phrase, positions)
-    }
-
-    for (const [phrase, positions] of occurrences) {
-      // --------------------------------------
-      // Muchas apariciones
-      // --------------------------------------
-
-      if (positions.length >= 12) {
-        const first = positions[0]
-        const last = positions[positions.length - 1]
-
-        const span = last - first
-
-        // La frase aparece muchas veces
-        // en relativamente poco texto.
-        if (span < 3000) {
-          console.warn(
-            `⚠️ Frase repetida detectada: "${phrase}" (${positions.length} veces).`,
-          )
-
-          return true
-        }
-      }
-    }
-  }
-
-  // ------------------------------------------
-  // 3. CONSECUTIVE BLOCK REPETITION
-  //
-  // Detecta:
-  //
-  // A B C D
-  // A B C D
-  // A B C D
-  //
-  // aunque no sean frases.
-  // ------------------------------------------
-
-  const blockSizes = [5, 8, 10, 15, 20]
-
-  for (const blockSize of blockSizes) {
-    for (let i = 0; i <= words.length - blockSize * 3; i++) {
-      const block1 = words.slice(i, i + blockSize).join(" ")
-
-      const block2 = words.slice(i + blockSize, i + blockSize * 2).join(" ")
-
-      const block3 = words.slice(i + blockSize * 2, i + blockSize * 3).join(" ")
-
-      if (block1 === block2 && block2 === block3) {
-        console.warn(
-          `⚠️ Bloque de ${blockSize} palabras repetido 3 veces consecutivas.`,
-        )
-
-        return true
-      }
-    }
-  }
-
-  // ------------------------------------------
-  // 4. REPEATED SENTENCES
-  //
-  // Detecta una misma oración repetida.
-  // ------------------------------------------
-
-  const sentences = normalized
-    .split(/[.!?]+/)
-    .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence.length > 20)
-
-  if (sentences.length >= 8) {
-    const sentenceCounts = new Map()
-
-    for (const sentence of sentences) {
-      const count = (sentenceCounts.get(sentence) || 0) + 1
-
-      sentenceCounts.set(sentence, count)
-
-      if (count >= 5) {
-        console.warn(
-          `⚠️ Oración repetida ${count} veces: "${sentence.slice(0, 150)}"`,
-        )
-
-        return true
-      }
-    }
-  }
-
-  // ------------------------------------------
-  // 5. OUTPUT DOMINATED BY ONE PHRASE
-  //
-  // Evita casos donde una frase aparece
-  // miles de veces pero no necesariamente
-  // de forma consecutiva.
-  // ------------------------------------------
-
-  const phraseSize = 4
-  const phraseCounts = new Map()
-
-  for (let i = 0; i <= words.length - phraseSize; i++) {
-    const phrase = words.slice(i, i + phraseSize).join(" ")
-
-    phraseCounts.set(phrase, (phraseCounts.get(phrase) || 0) + 1)
-  }
-
-  let mostRepeatedPhrase = null
-  let mostRepeatedCount = 0
-
-  for (const [phrase, count] of phraseCounts) {
-    if (count > mostRepeatedCount) {
-      mostRepeatedPhrase = phrase
-      mostRepeatedCount = count
-    }
-  }
-
-  if (mostRepeatedPhrase) {
-    const repetitionRatio = (mostRepeatedCount * phraseSize) / words.length
-
-    // Si una misma frase de 4 palabras
-    // representa más del 20% del texto,
-    // es extremadamente sospechoso.
-    if (mostRepeatedCount >= 20 && repetitionRatio > 0.2) {
-      console.warn(`⚠️ La transcripción está dominada por una frase repetida.`)
-
-      console.warn(`Frase: "${mostRepeatedPhrase}"`)
-
-      console.warn(`Apariciones: ${mostRepeatedCount}`)
-
-      console.warn(`Ratio aproximado: ${(repetitionRatio * 100).toFixed(1)}%`)
-
-      return true
-    }
-  }
-
-  // ------------------------------------------
-  // 6. DETECTAR REPETICIÓN DE UNA VENTANA
-  //
-  // Esto intenta detectar casos como:
-  //
-  // A B C D E F G
-  // A B C D E F G
-  //
-  // aunque haya pequeñas diferencias
-  // alrededor del bloque.
-  // ------------------------------------------
-
-  const WINDOW_SIZE = 20
-
-  const windows = new Map()
-
-  for (let i = 0; i <= words.length - WINDOW_SIZE; i++) {
-    const window = words.slice(i, i + WINDOW_SIZE).join(" ")
-
-    const positions = windows.get(window) || []
-
-    positions.push(i)
-
-    windows.set(window, positions)
-  }
-
-  for (const [window, positions] of windows) {
-    if (positions.length >= 3) {
-      const first = positions[0]
-      const last = positions[positions.length - 1]
-
-      const span = last - first
-
-      if (span < 5000) {
-        console.warn(
-          `⚠️ Ventana de ${WINDOW_SIZE} palabras repetida ${positions.length} veces.`,
-        )
-
-        console.warn(`Contenido: "${window.slice(0, 200)}..."`)
-
-        return true
-      }
-    }
-  }
-
-  // ------------------------------------------
-  // 7. NO REPETITION DETECTED
-  // ------------------------------------------
-
-  return false
-}
-
-// --------------------------------------------------
-// TRANSCRIBE ONE CHUNK
-// --------------------------------------------------
-
-async function transcribeChunk(filePath, chunkNumber) {
-  let lastError
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      console.log("")
-      console.log(`[Chunk ${chunkNumber}] Transcribiendo...`)
-
-      console.log(`[Chunk ${chunkNumber}] Intento ${attempt}/${MAX_RETRIES}`)
-
-      // ------------------------------------------
-      // UPLOAD
-      // ------------------------------------------
-
-      const file = await uploadToGemini(filePath, chunkNumber)
-
-      const model = genAI.getGenerativeModel({
-        model: "gemini-3.1-flash-lite",
-      })
-
-      // ------------------------------------------
-      // PROMPT
-      // ------------------------------------------
-
-      let prompt
-
-      if (attempt === 1) {
-        prompt = `
-Generate a faithful transcript of the speech
-actually present in this audio segment.
-
-Process the audio strictly once, from beginning
-to end.
-
-IMPORTANT:
-Never repeat a phrase, sentence, paragraph or
-section that you have already transcribed.
-
-Do not continue generating text after the audio
-content has ended.
-
-Do not infer or invent speech.
-
-Use ONLY the audio supplied in this request.
-
-Return ONLY the transcript.
-`
-      } else if (attempt === 2) {
-        prompt = `
-Transcribe ONLY the human speech that is actually
-audible in this audio segment.
-
-Process the audio sequentially from start to finish.
-
-Each spoken passage must appear exactly once.
-
-IMPORTANT:
-If you notice that you are generating the same
-sentence or phrase repeatedly, STOP and continue
-with the next part of the audio.
-
-Never loop.
-
-Never repeat previously transcribed content.
-
-Do not use outside knowledge.
-
-Do not invent missing words.
-
-Return ONLY the transcript.
-`
-      } else {
-        prompt = `
-Produce a clean chronological transcription of
-this audio segment.
-
-Use only the supplied audio.
-
-This is one segment of a larger conference.
-
-Do not summarize.
-
-Do not repeat.
-
-Do not hallucinate.
-
-Do not reconstruct speech that is not audible.
-
-Every part of the spoken audio must be represented
-at most once.
-
-If the audio contains silence or unintelligible
-content, omit it.
-
-Return ONLY the transcription.
-`
-      }
-
-      // ------------------------------------------
-      // GENERATION CONFIG
-      // ------------------------------------------
-
-      const temperature = attempt === 1 ? 0 : attempt === 2 ? 0.1 : 0.2
-
-      // ------------------------------------------
-      // GEMINI REQUEST
-      // ------------------------------------------
-
-      const result = await model.generateContent({
-        contents: [
-          {
-            role: "user",
-
-            parts: [
-              {
-                fileData: {
-                  mimeType: file.mimeType,
-
-                  fileUri: file.uri,
-                },
-              },
-
-              {
-                text: prompt,
-              },
-            ],
-          },
-        ],
-
-        generationConfig: {
-          temperature,
-        },
-      })
-
-      // ------------------------------------------
-      // CHECK GEMINI CANDIDATE
-      // ------------------------------------------
-
-      const candidate = result.response?.candidates?.[0]
-
-      const finishReason = candidate?.finishReason
-
-      console.log(
-        `[Chunk ${chunkNumber}] Finish reason: ${finishReason || "NONE"}`,
-      )
-
-      // ------------------------------------------
-      // RECITATION
-      // ------------------------------------------
-
-      if (finishReason === "RECITATION") {
-        console.warn("")
-        console.warn(
-          `⚠️ [Chunk ${chunkNumber}] Gemini bloqueó la respuesta por RECITATION.`,
-        )
-
-        console.warn(
-          `[Chunk ${chunkNumber}] Se utilizará un prompt alternativo en el siguiente intento.`,
-        )
-
-        throw new Error("GEMINI_RECITATION")
-      }
-
-      // ------------------------------------------
-      // OTHER BLOCKED RESPONSES
-      // ------------------------------------------
-
-      if (
-        finishReason === "SAFETY" ||
-        finishReason === "BLOCKLIST" ||
-        finishReason === "PROHIBITED_CONTENT"
-      ) {
-        throw new Error(`GEMINI_BLOCKED_${finishReason}`)
-      }
-
-      // ------------------------------------------
-      // GET TEXT
-      // ------------------------------------------
-
-      let transcription
-
-      try {
-        transcription = result.response.text().trim()
-      } catch (responseError) {
-        console.error(`[Chunk ${chunkNumber}] Gemini no pudo devolver texto.`)
-
-        console.error(responseError)
-
-        throw responseError
-      }
-
-      // ------------------------------------------
-      // EMPTY RESPONSE
-      // ------------------------------------------
-
-      if (!transcription) {
-        console.log(`[Chunk ${chunkNumber}] Gemini no detectó habla.`)
-
-        return {
-          chunk: chunkNumber,
-
-          transcription: "",
-        }
-      }
-
-      // ------------------------------------------
-      // REPETITION DETECTION
-      // ------------------------------------------
-
-      const suspicious = detectSuspiciousRepetition(transcription)
-
-      if (suspicious) {
-        console.warn(
-          `[Chunk ${chunkNumber}] Gemini produjo una transcripción sospechosamente repetitiva.`,
-        )
-
-        throw new Error("GEMINI_REPETITIVE_OUTPUT")
-      }
-
-      return {
-        chunk: chunkNumber,
-        transcription,
-      }
-    } catch (error) {
-      lastError = error
-
-      console.error("")
-      console.error(`[Chunk ${chunkNumber}] Error.`)
-
-      console.error(`Intento ${attempt}/${MAX_RETRIES}`)
-
-      console.error(error.message)
-
-      // ------------------------------------------
-      // RETRY
-      // ------------------------------------------
-
-      if (attempt < MAX_RETRIES) {
-        const waitTime =
-          error.message === "GEMINI_RECITATION"
-            ? 3000
-            : error.message === "GEMINI_REPETITIVE_OUTPUT"
-              ? 3000
-              : 5000 * attempt
-
-        console.log(
-          `[Chunk ${chunkNumber}] Reintentando en ${
-            waitTime / 1000
-          } segundos...`,
-        )
-
-        await sleep(waitTime)
-      }
-    }
-  }
-
-  // ------------------------------------------
-  // ALL ATTEMPTS FAILED
-  // ------------------------------------------
-
-  throw lastError
-}
-
-// --------------------------------------------------
-// PROCESS CHUNKS
-// --------------------------------------------------
-
-async function processChunks(chunks) {
-  const results = new Array(chunks.length)
-
-  let currentIndex = 0
-
-  async function worker(workerId) {
-    while (true) {
-      const index = currentIndex++
-
-      if (index >= chunks.length) {
-        return
-      }
-
-      console.log(
-        `[Worker ${workerId}] Processing chunk ${index + 1}/${chunks.length}`,
-      )
-
-      try {
-        results[index] = await transcribeChunk(chunks[index], index)
-      } catch (error) {
-        console.error(`[Chunk ${index}] FAILED after all retries.`)
-
-        console.error(error.message)
-
-        results[index] = {
-          chunk: index,
-          transcription: "",
-          failed: true,
-          error: error.message,
-        }
-      }
-    }
-  }
-
-  const workers = Array.from(
-    {
-      length: Math.min(MAX_CONCURRENCY, chunks.length),
-    },
-    (_, index) => worker(index + 1),
-  )
-
-  await Promise.all(workers)
-
-  return results
-}
-// --------------------------------------------------
-// MERGE TRANSCRIPTIONS
-// --------------------------------------------------
-
-function mergeTranscriptions(results) {
-  return results
-    .sort((a, b) => a.chunk - b.chunk)
-    .map((result) => result.transcription)
-    .filter(Boolean)
-    .join("\n\n")
-}
-
-// --------------------------------------------------
-// TRANSCRIBE ENDPOINT
-// --------------------------------------------------
-
-app.post("/transcribe", upload.any(), async (req, res) => {
-  const jobId = crypto.randomUUID()
-
-  let localFilePath
-  let processingDirectory
-
-  try {
-    // ------------------------------------------
-    // VALIDATE FILE
-    // ------------------------------------------
-
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({
-        error: "No se recibió ningún archivo de audio.",
-      })
-    }
-
-    const uploadedFile = req.files[0]
-
-    localFilePath = uploadedFile.path
-
-    processingDirectory = path.join("processing", jobId)
-
-    ensureDirectory(processingDirectory)
-
-    console.log("")
-    console.log("========================================")
-    console.log("NUEVA TRANSCRIPCIÓN")
-    console.log("========================================")
-    console.log(`Job: ${jobId}`)
-    console.log(`Archivo: ${uploadedFile.originalname}`)
-    console.log(`MIME: ${uploadedFile.mimetype}`)
-    console.log("========================================")
-    console.log("")
-
-    // ------------------------------------------
-    // 1. CLEAN + SPLIT AUDIO
-    // ------------------------------------------
-
-    const chunks = await splitAudio(localFilePath, processingDirectory)
-
-    console.log("")
-    console.log("Verificando chunks antes de comenzar Gemini...")
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i]
-
-      if (!fs.existsSync(chunk)) {
-        throw new Error(
-          `Chunk desapareció antes de comenzar la transcripción: ${chunk}`,
-        )
-      }
-
-      const stats = fs.statSync(chunk)
-
-      if (stats.size === 0) {
-        throw new Error(
-          `Chunk vacío antes de comenzar la transcripción: ${chunk}`,
-        )
-      }
-
-      console.log(
-        `[VERIFY ${i}] ${path.basename(chunk)} - ${(
-          stats.size /
-          1024 /
-          1024
-        ).toFixed(2)} MB`,
-      )
-    }
-
-    console.log(`Todos los ${chunks.length} chunks están disponibles.`)
-
-    // ------------------------------------------
-    // 2. TRANSCRIBE CHUNKS
-    // ------------------------------------------
-
-    const results = await processChunks(chunks)
-
-    const failedChunks = results.filter((result) => result.failed)
-
-    console.log(
-      `Chunks completados: ${
-        results.length - failedChunks.length
-      }/${results.length}`,
-    )
-
-    console.log(`Chunks fallidos: ${failedChunks.length}`)
-
-    if (failedChunks.length > 0) {
-      console.warn(
-        "⚠️ Chunks que necesitan reprocesamiento:",
-        failedChunks.map((chunk) => chunk.chunk),
-      )
-    }
-
-    // ------------------------------------------
-    // 3. MERGE
-    // ------------------------------------------
-
-    const transcription = mergeTranscriptions(results)
-
-    // ------------------------------------------
-    // 4. SAVE TXT
-    // ------------------------------------------
-
-    const outputFile = path.join(
-      processingDirectory,
-      `transcripcion_${jobId}.txt`,
-    )
-
-    fs.writeFileSync(outputFile, transcription, "utf8")
-
-    console.log("")
-    console.log("========================================")
-    console.log("TRANSCRIPCIÓN COMPLETADA")
-    console.log("========================================")
-    console.log(`Chunks: ${chunks.length}`)
-    console.log(`Caracteres: ${transcription.length}`)
-    console.log(`Archivo: ${outputFile}`)
-    console.log("========================================")
-    console.log("")
-
-    // ------------------------------------------
-    // 5. DELETE ORIGINAL UPLOAD
-    // ------------------------------------------
-
-    if (localFilePath && fs.existsSync(localFilePath)) {
-      fs.unlinkSync(localFilePath)
-    }
-
-    // ------------------------------------------
-    // 6. RESPONSE
-    // ------------------------------------------
-
-    return res.json({
-      success: true,
-
-      jobId,
-
-      fileName: uploadedFile.originalname,
-
-      chunks: chunks.length,
-
-      transcription,
-    })
-  } catch (error) {
-    console.error("")
-    console.error("========================================")
-    console.error("ERROR DURANTE LA TRANSCRIPCIÓN")
-    console.error("========================================")
-    console.error(error)
-    console.error("========================================")
-    console.error("Error type:", error.message)
-
-    if (localFilePath && fs.existsSync(localFilePath)) {
-      try {
-        fs.unlinkSync(localFilePath)
-      } catch {}
-    }
-
-    return res.status(500).json({
-      success: false,
-
-      error: "Ocurrió un error al procesar la transcripción.",
-
-      details: error.message,
-
-      jobId,
-    })
-  } finally {
-    // ------------------------------------------
-    // CLEAN TEMPORARY FILES
-    // ------------------------------------------
-
-    if (processingDirectory) {
-      console.log(`Processing directory: ${processingDirectory}`)
-    }
-  }
-})
-
-// --------------------------------------------------
-// CLEAN TRANSCRIPTION
-// --------------------------------------------------
-
-const CLEAN_CHUNK_SIZE = 25000
-
-const CLEAN_MAX_CONCURRENCY = 1
-
-const CLEAN_MAX_RETRIES = 3
-
-// --------------------------------------------------
-// SPLIT TRANSCRIPT INTO TEXT CHUNKS
-// --------------------------------------------------
-
-function splitTranscript(text, maxChars = CLEAN_CHUNK_SIZE) {
-  const chunks = []
-
-  let current = ""
-
-  // Intentamos cortar por párrafos/frases,
-  // no arbitrariamente en mitad de una palabra.
-  const paragraphs = text.split(/\n+/)
-
-  for (const paragraph of paragraphs) {
-    const cleanParagraph = paragraph.trim()
-
-    if (!cleanParagraph) {
-      continue
-    }
-
-    // Si el párrafo individual es demasiado grande,
-    // lo cortamos por frases.
-    if (cleanParagraph.length > maxChars) {
-      const sentences = cleanParagraph.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [
-        cleanParagraph,
-      ]
-
-      for (const sentence of sentences) {
-        const cleanSentence = sentence.trim()
-
-        if (!cleanSentence) {
-          continue
-        }
-
-        if (current.length + cleanSentence.length + 1 > maxChars) {
-          if (current) {
-            chunks.push(current.trim())
-          }
-
-          current = cleanSentence
-        } else {
-          current += " " + cleanSentence
-        }
-      }
-
-      continue
-    }
-
-    if (current.length + cleanParagraph.length + 2 > maxChars) {
-      if (current) {
-        chunks.push(current.trim())
-      }
-
-      current = cleanParagraph
-    } else {
-      current += (current ? "\n\n" : "") + cleanParagraph
-    }
-  }
-
-  if (current) {
-    chunks.push(current.trim())
-  }
-
-  return chunks
-}
-
-// --------------------------------------------------
-// RETRY HELPER
-// --------------------------------------------------
-
-async function runGeminiWithRetry(callback, label) {
-  let lastError
-
-  for (let attempt = 1; attempt <= CLEAN_MAX_RETRIES; attempt++) {
-    try {
-      console.log(`[${label}] Gemini attempt ${attempt}/${CLEAN_MAX_RETRIES}`)
-
-      return await callback()
-    } catch (error) {
-      lastError = error
-
-      console.error(`[${label}] Error:`, error.message)
-
-      if (attempt < CLEAN_MAX_RETRIES) {
-        await sleep(3000 * attempt)
-      }
-    }
-  }
-
-  throw lastError
-}
-
-// --------------------------------------------------
-// CLEAN ONE TRANSCRIPT CHUNK
-// --------------------------------------------------
-
-async function cleanTranscriptChunk(transcriptChunk, chunkNumber) {
-  const responseSchema = {
-    type: SchemaType.OBJECT,
-
-    properties: {
-      cleaned_content: {
-        type: SchemaType.STRING,
-      },
-    },
-
-    required: ["cleaned_content"],
-  }
-
-  const model = genAI.getGenerativeModel({
-    model: "gemini-3.1-flash-lite",
-
-    generationConfig: {
-      responseMimeType: "application/json",
-
-      responseSchema,
-
-      temperature: 0,
-    },
-  })
-
-  const prompt = `
-You are cleaning one segment of a conference transcript.
-
-Your ONLY task is to clean the transcript.
-
-Rules:
-
-- Preserve all meaningful spoken content.
-- Preserve the original meaning.
-- Preserve chronological order.
-- Remove filler words such as:
-  "um", "uh", "erm", "you know", etc.
-- Remove obvious transcription artifacts.
-- Remove accidental duplicated words.
-- Correct obvious spelling errors.
-- Correct obvious transcription mistakes when the intended word is clear.
-- Correct obvious split words.
-- Preserve technical terminology.
-- Preserve names.
-- Preserve company names.
-- Preserve product names.
-- Preserve numbers and statistics.
-- Do NOT summarize.
-- Do NOT paraphrase.
-- Do NOT rewrite the speaker's ideas.
-- Do NOT add information.
-- Do NOT invent information.
-- Do NOT remove meaningful repetition.
-- Return ONLY the cleaned transcript.
-
-This is only one part of a larger transcript.
-Do not add introductions or conclusions.
-
-Return the cleaned content as a single string.
-`
-
-  return runGeminiWithRetry(async () => {
-    const result = await model.generateContent([
-      {
-        text: prompt,
-      },
-      {
-        text: "TRANSCRIPT SEGMENT:\n\n" + transcriptChunk,
-      },
-    ])
-
-    const raw = result.response.text()
-
-    if (!raw) {
-      throw new Error("Gemini returned an empty response.")
-    }
-
-    let parsed
-
-    try {
-      parsed = JSON.parse(raw)
-    } catch {
-      throw new Error("Gemini returned invalid JSON while cleaning chunk.")
-    }
-
-    if (!parsed.cleaned_content) {
-      throw new Error("Gemini returned empty cleaned_content.")
-    }
-
-    console.log(
-      `[Clean chunk ${chunkNumber}] Completed (${parsed.cleaned_content.length} chars)`,
-    )
-
-    return {
-      chunk: chunkNumber,
-
-      cleaned_content: parsed.cleaned_content.trim(),
-    }
-  }, `Clean chunk ${chunkNumber}`)
-}
-
-// --------------------------------------------------
-// PROCESS CLEANING CHUNKS
-// --------------------------------------------------
-
-async function cleanTranscriptChunks(chunks) {
-  const results = new Array(chunks.length)
-
-  let currentIndex = 0
-
-  async function worker(workerId) {
-    while (true) {
-      const index = currentIndex++
-
-      if (index >= chunks.length) {
-        return
-      }
-
-      console.log(
-        `[Clean worker ${workerId}] Processing chunk ${index + 1}/${chunks.length}`,
-      )
-
-      results[index] = await cleanTranscriptChunk(chunks[index], index)
-    }
-  }
-
-  const workers = Array.from(
-    {
-      length: Math.min(CLEAN_MAX_CONCURRENCY, chunks.length),
-    },
-    (_, index) => worker(index + 1),
-  )
-
-  await Promise.all(workers)
-
-  return results
-}
-
-// --------------------------------------------------
-// FINAL SPEAKER EXTRACTION
-// --------------------------------------------------
-
-async function extractSpeakers(cleanedTranscript, sheetData) {
-  const responseSchema = {
-    type: SchemaType.ARRAY,
-
-    items: {
-      type: SchemaType.OBJECT,
-
-      properties: {
-        id: {
-          type: SchemaType.STRING,
-        },
-
-        speaker: {
-          type: SchemaType.STRING,
-        },
-
-        metadata: {
-          type: SchemaType.OBJECT,
-
-          properties: {
-            conference: {
-              type: SchemaType.STRING,
-            },
-
-            date: {
-              type: SchemaType.STRING,
-            },
-
-            title: {
-              type: SchemaType.STRING,
-            },
-
-            role: {
-              type: SchemaType.STRING,
-            },
-
-            organization: {
-              type: SchemaType.STRING,
-            },
-
-            topics: {
-              type: SchemaType.ARRAY,
-
-              items: {
-                type: SchemaType.STRING,
-              },
-            },
-          },
-
-          required: [
-            "conference",
-            "date",
-            "title",
-            "role",
-            "organization",
-            "topics",
-          ],
-        },
-
-        cleaned_content: {
-          type: SchemaType.STRING,
-        },
-      },
-
-      required: ["id", "speaker", "metadata", "cleaned_content"],
-    },
-  }
-
-  const model = genAI.getGenerativeModel({
-    model: "gemini-3.1-flash-lite",
-
-    generationConfig: {
-      responseMimeType: "application/json",
-
-      responseSchema,
-
-      temperature: 0,
-    },
-  })
-
-  const sheetDataString = JSON.stringify(sheetData, null, 2)
-
-  const prompt = `
-You are analyzing a cleaned conference transcript.
-
-Your task is to identify the REAL SPEAKERS who actually speak
-and associate them with the provided reference metadata.
-
-IMPORTANT:
-
-The transcript is the source of truth for determining
-who actually speaks.
-
-The reference data is ONLY the source of truth for metadata.
-
-Do NOT add people simply because they exist in the reference data.
-
-==================================================
-SPEAKER IDENTIFICATION
-==================================================
-
-Identify the distinct people who actually speak.
-
-Normally a conference contains approximately 4-5 speakers,
-but DO NOT force this number.
-
-If only 3 people actually speak, return 3.
-
-If 4 people speak, return 4.
-
-If 5 people speak, return 5.
-
-Do not invent speakers.
-
-Do not include people who are merely mentioned.
-
-Do not include people who are thanked but never speak.
-
-Do not include hosts.
-
-Do not include moderators.
-
-Do not include interviewers.
-
-Do not include presenters whose contribution consists
-only of introducing another speaker.
-
-One person must correspond to exactly one object.
-
-==================================================
-IDENTITY
-==================================================
-
-Use the transcript to determine speaker identity.
-
-Use the reference metadata to match the identity.
-
-Do not invent surnames.
-
-Do not guess an identity when there is insufficient evidence.
-
-If a speaker cannot be confidently matched to the reference data,
-do not invent metadata.
-
-==================================================
-CONTENT
-==================================================
-
-For each speaker:
-
-Aggregate ALL content belonging to that speaker.
-
-Preserve chronological order.
-
-Remove filler words.
-
-Remove transcription artifacts.
-
-Correct obvious transcription mistakes.
-
-Do not summarize.
-
-Do not paraphrase.
-
-Do not rewrite the speaker.
-
-Do not add information.
-
-Preserve technical terminology.
-
-Preserve names, companies, products, numbers and statistics.
-
-==================================================
-METADATA
-==================================================
-
-Use the reference data ONLY for:
-
-- conference
-- date
-- title
-- role
-- organization
-
-Do not invent missing metadata.
-
-Do not create speakers from reference rows that never speak.
-
-==================================================
-TOPICS
-==================================================
-
-Generate 10-20 searchable topics based ONLY
-on each speaker's actual content.
-
-Avoid generic topics.
-
-==================================================
-FINAL VALIDATION
-==================================================
-
-Before returning:
-
-- One object per real speaker.
-- No duplicate speakers.
-- No hosts.
-- No moderators.
-- No people who only appear in the reference data.
-- All content for a speaker is merged.
-- Content remains chronological.
-- No invented information.
-- Valid JSON only.
-
-REFERENCE DATA:
-
-${sheetDataString}
-
-END REFERENCE DATA.
-`
-
-  return runGeminiWithRetry(async () => {
-    const result = await model.generateContent([
-      {
-        text: prompt,
-      },
-
-      {
-        text: "CLEANED TRANSCRIPT:\n\n" + cleanedTranscript,
-      },
-    ])
-
-    const raw = result.response.text()
-
-    if (!raw) {
-      throw new Error("Gemini returned an empty speaker response.")
-    }
-
-    let parsed
-
-    try {
-      parsed = JSON.parse(raw)
-    } catch {
-      console.error("Invalid speaker JSON:", raw.substring(0, 2000))
-
-      throw new Error("Gemini returned invalid JSON while extracting speakers.")
-    }
-
-    if (!Array.isArray(parsed)) {
-      throw new Error("Speaker response is not an array.")
-    }
-
-    return parsed
-  }, "Speaker extraction")
-}
-
-// --------------------------------------------------
-// CLEAN TRANSCRIPTION ENDPOINT
-// --------------------------------------------------
-
-// --------------------------------------------------
-// CLEAN TRANSCRIPTION ENDPOINT (2-PASS ARCHITECTURE)
-// --------------------------------------------------
-
-// --------------------------------------------------
-// FUNCIONES AUXILIARES
-// --------------------------------------------------
 function findFuzzyIndex(fullText, quote, searchFromIndex = 0) {
   if (!quote) return -1
-  const cleanQuote = quote.toLowerCase().replace(/[^a-z0-9]/gi, "")
-  if (cleanQuote.length < 10) return -1
 
-  let cleanText = ""
-  const indexMap = []
+  // Normaliza espacios pero mantiene la estructura
+  const normalizeQuote = (str) => {
+    return str.trim().toLowerCase().replace(/\s+/g, " ")
+  }
 
-  for (let i = searchFromIndex; i < fullText.length; i++) {
-    const char = fullText[i]
-    if (/[a-z0-9]/i.test(char)) {
-      cleanText += char.toLowerCase()
-      indexMap.push(i)
+  const cleanQuote = normalizeQuote(quote)
+
+  // Requiere al menos 15 caracteres significativos
+  if (cleanQuote.length < 15) return -1
+
+  // Buscar por palabras, no solo caracteres
+  const words = cleanQuote.split(" ")
+  const minWordsToMatch = Math.max(3, Math.floor(words.length * 0.7)) // 70% coincidencia
+
+  let currentPos = searchFromIndex
+
+  while (currentPos < fullText.length) {
+    // Buscar la primera palabra
+    const firstWordIndex = fullText.toLowerCase().indexOf(words[0], currentPos)
+    if (firstWordIndex === -1) return -1
+
+    // Extraer contexto alrededor (200 caracteres después)
+    const contextEnd = Math.min(firstWordIndex + 200, fullText.length)
+    const context = normalizeQuote(
+      fullText.substring(firstWordIndex, contextEnd),
+    )
+
+    // Contar cuántas palabras coinciden
+    let matchedWords = 0
+    for (const word of words) {
+      if (context.includes(word)) {
+        matchedWords++
+      }
     }
+
+    // Si coinciden suficientes palabras, es un match
+    if (matchedWords >= minWordsToMatch) {
+      return firstWordIndex
+    }
+
+    currentPos = firstWordIndex + 1
   }
 
-  const cleanIndex = cleanText.indexOf(cleanQuote)
-  if (cleanIndex !== -1) {
-    return indexMap[cleanIndex]
-  }
   return -1
 }
 
-// Limpia textos largos dividiéndolos en fragmentos para no chocar con el límite de tokens
+// --------------------------------------------------
+// INTELLIGENT SPEAKER END DETECTION (Cambio 2)
+// --------------------------------------------------
+
+function findSpeakerEnd(text, startIndex, speakerName, nextSpeakers = []) {
+  if (startIndex < 0 || startIndex >= text.length) return text.length
+
+  // Buscar menciones de los SIGUIENTES speakers
+  let closestNextSpeaker = text.length
+  for (const nextSpeaker of nextSpeakers) {
+    const firstWords = nextSpeaker.split(" ").slice(0, 3).join(" ")
+    const idx = text
+      .toLowerCase()
+      .indexOf(firstWords.toLowerCase(), startIndex + 100)
+    if (idx !== -1 && idx < closestNextSpeaker) {
+      closestNextSpeaker = idx
+    }
+  }
+
+  // Límite máximo de longitud (30-40 minutos de audio = 30KB texto)
+  const maxSpeakerLength = 30000
+  const heuristicEnd = startIndex + maxSpeakerLength
+
+  // Retornar el que sea MENOR
+  return Math.min(closestNextSpeaker, heuristicEnd, text.length)
+}
+
+// --------------------------------------------------
+// CLEAN TEXT IN CHUNKS
+// --------------------------------------------------
+
 async function cleanTextInChunks(text, model) {
   const MAX_CHARS = 20000
   let cleanedFullText = ""
@@ -1641,7 +159,7 @@ async function cleanTextInChunks(text, model) {
 
     const chunk = text.substring(start, end)
     console.log(
-      `     -> Limpiando fragmento de limpieza ${chunkIndex}... (${chunk.length} caracteres)`,
+      `     -> Limpiando fragmento ${chunkIndex}... (${chunk.length} caracteres)`,
     )
 
     const cleanPrompt = `Clean the following transcript verbatim. Do NOT summarize or shorten. Fix typos and remove filler words:\n\n${chunk}`
@@ -1651,7 +169,7 @@ async function cleanTextInChunks(text, model) {
       cleanedFullText += result.response.text().trim() + "\n\n"
     } catch (e) {
       console.error(`     [Error en fragmento ${chunkIndex}]:`, e.message)
-      // Fallback: si falla la IA en este pedacito, guardamos el texto crudo para no perder al orador
+      // Fallback: guardar texto crudo si falla la IA
       cleanedFullText += chunk.trim() + "\n\n"
     }
 
@@ -1662,22 +180,28 @@ async function cleanTextInChunks(text, model) {
 }
 
 // --------------------------------------------------
-// CLEAN TRANSCRIPTION ENDPOINT
+// CLEAN TRANSCRIPTION ENDPOINT - MAIN
 // --------------------------------------------------
 
 app.post("/clean-transcription", async (req, res) => {
-  console.log("Iniciando limpieza de transcripción con Fragmentación Total...")
+  console.log("Iniciando limpieza de transcripción...")
   const { fileName, transcriptionText, sheetData } = req.body
 
   if (!sheetData) {
     return res.status(400).json({ error: "Missing sheetData in request body." })
   }
 
+  if (!transcriptionText) {
+    return res
+      .status(400)
+      .json({ error: "Missing transcriptionText in request body." })
+  }
+
   try {
     const sheetDataString = JSON.stringify(sheetData)
 
     // =========================================================================
-    // PASO 1: Identificación Dividida en Bloques (Evita "Lost in the Middle")
+    // PASO 1: Identificación en Bloques (con chunks pequeños)
     // =========================================================================
     const pass1Model = genAI.getGenerativeModel({
       model: "gemini-3.5-flash-lite",
@@ -1707,11 +231,11 @@ app.post("/clean-transcription", async (req, res) => {
               },
               start_quote: {
                 type: SchemaType.STRING,
-                description: "Primeras 15 palabras",
+                description: "Primeras 20 palabras exactas",
               },
               end_quote: {
                 type: SchemaType.STRING,
-                description: "Últimas 15 palabras",
+                description: "Últimas 20 palabras exactas",
               },
             },
             required: ["id", "speaker", "metadata", "start_quote", "end_quote"],
@@ -1721,36 +245,43 @@ app.post("/clean-transcription", async (req, res) => {
     })
 
     let speakerSegments = []
-    const STEP1_CHUNK = 100000 // Analiza el texto en bloques de 100,000 caracteres
 
     console.log(
-      `\nPaso 1: Mapeando oradores (El texto total tiene ${transcriptionText.length} caracteres)`,
+      `\nPaso 1: Mapeando oradores (Texto total: ${transcriptionText.length} caracteres)`,
     )
 
     for (let i = 0; i < transcriptionText.length; i += STEP1_CHUNK) {
       const textChunk = transcriptionText.substring(i, i + STEP1_CHUNK)
       console.log(
-        `\n-> Buscando oradores en bloque del texto: pos. ${i} a ${i + textChunk.length}...`,
+        `\n-> Analizando bloque: pos. ${i} a ${i + textChunk.length}...`,
       )
 
       const pass1Prompt = `
-Analyze this chunk of transcript and identify all speakers matching the sheet data: ${sheetDataString}.
+Analyze this chunk of transcript and identify ALL speakers matching the sheet data: ${sheetDataString}.
 
-CRITICAL RULES:
-1. FUZZY MATCHING: Be highly aggressive in matching phonetically.
+CRITICAL RULES FOR ACCURACY:
+1. FUZZY MATCHING: Match phonetically, including name variations (Jon/John, Steve/Stephen, etc.)
 2. COMPANY/ROLE MATCHING: If a first name + organization matches the sheet, ACCEPT IT.
-3. MISSING LABELS: Look for MC introductions to find where a speaker begins.
-4. EXTRACTION: Extract exact FIRST 15 words (start_quote) and LAST 15 words (end_quote) spoken by them IN THIS CHUNK.
-5. ID FORMAT: "talk-10-munich26" sequentially. Date MUST be "July 1, 2026". Conference "Apidays ${sheetDataString} title 2026".
+3. CONTEXT AWARENESS: Look for MC introductions like "Please welcome..." or "Here's..."
+4. EXACT QUOTES: Extract FIRST 20 WORDS (start_quote) and LAST 20 WORDS (end_quote) 
+   spoken by them IN THIS CHUNK ONLY. These should be EXACT verbatim quotes.
+5. ID FORMAT: Sequential "talk-10-munich26", "talk-11-munich26", etc. Date "July 8, 2026" for Day 1.
+6. AVOID DUPLICATES: If you find the same speaker multiple times, only report once per chunk.
+
+IMPORTANT: Only return speakers you are CONFIDENT about (>85% certainty).
+Return empty array [] if you find no speakers in this chunk.
 
 TRANSCRIPT CHUNK:
 ${textChunk}
+
+Return ONLY valid JSON array.
 `
+
       try {
         const result = await pass1Model.generateContent(pass1Prompt)
         const chunkSpeakers = JSON.parse(result.response.text())
 
-        // Guardar el texto del bloque para buscar las comillas solo en esta sección
+        // Guardar el texto del bloque y su offset
         chunkSpeakers.forEach((s) => {
           s.chunkOffset = i
           s.chunkText = textChunk
@@ -1758,21 +289,19 @@ ${textChunk}
 
         speakerSegments = speakerSegments.concat(chunkSpeakers)
         console.log(
-          `   Se detectaron ${chunkSpeakers.length} intervención(es) de oradores en este bloque.`,
+          `   ✓ Se detectaron ${chunkSpeakers.length} intervención(es).`,
         )
       } catch (e) {
-        console.warn(
-          `   Aviso: No se identificaron oradores válidos en este bloque o hubo un error JSON.`,
-        )
+        console.warn(`   [Aviso] Error o sin oradores en este bloque.`)
       }
     }
 
     console.log(
-      `\nPaso 1 completado. Total de intervenciones detectadas a lo largo del audio: ${speakerSegments.length}`,
+      `\nPaso 1 completado. Total de intervenciones: ${speakerSegments.length}`,
     )
 
     // =========================================================================
-    // PASO 2: Limpieza Verbatim por Chunks
+    // PASO 2: Limpieza Verbatim por Segmento
     // =========================================================================
     const cleanerModel = genAI.getGenerativeModel({
       model: "gemini-3.5-flash-lite",
@@ -1787,50 +316,88 @@ CRITICAL DIRECTIVES:
     const intermediateData = []
     let idCounter = 10
 
-    for (const segment of speakerSegments) {
-      console.log(`\n--- Extrayendo segmento para: ${segment.speaker} ---`)
+    for (
+      let segmentIdx = 0;
+      segmentIdx < speakerSegments.length;
+      segmentIdx++
+    ) {
+      const segment = speakerSegments[segmentIdx]
+      console.log(
+        `\n--- Extrayendo segmento ${segmentIdx + 1}/${speakerSegments.length}: ${segment.speaker} ---`,
+      )
 
-      // Buscar las comillas DENTRO del bloque específico donde Gemini las detectó
+      // Obtener lista de speakers siguientes para detección inteligente de límites
+      const nextSpeakers = speakerSegments
+        .slice(segmentIdx + 1, segmentIdx + 5)
+        .map((s) => s.speaker)
+
+      // Buscar el inicio
       const startIndex = findFuzzyIndex(
         segment.chunkText,
         segment.start_quote,
         0,
       )
-      const safeStartIndex = startIndex !== -1 ? startIndex : 0
-      const endIndex = findFuzzyIndex(
+
+      if (startIndex === -1) {
+        console.warn(`[Error] No se encontró el inicio. Saltando.`)
+        continue
+      }
+
+      // Encontrar el final inteligentemente
+      const endIndex = findSpeakerEnd(
         segment.chunkText,
-        segment.end_quote,
-        safeStartIndex,
+        startIndex,
+        segment.speaker,
+        nextSpeakers,
       )
 
-      let rawSpeakerText = ""
+      // Extraer el texto
+      let rawSpeakerText = segment.chunkText.substring(startIndex, endIndex)
 
-      if (startIndex !== -1 && endIndex !== -1 && startIndex < endIndex) {
-        rawSpeakerText = segment.chunkText.substring(
-          startIndex,
-          endIndex + segment.end_quote.length + 100,
-        )
-        console.log(
-          `[Éxito] Texto extraído por comillas. Longitud: ${rawSpeakerText.length} caracteres.`,
-        )
-      } else if (startIndex !== -1) {
-        rawSpeakerText = segment.chunkText.substring(startIndex)
+      // DEBUG
+      console.log(`[DEBUG] ${segment.speaker}:`)
+      console.log(`  Start Index: ${startIndex}`)
+      console.log(`  End Index: ${endIndex}`)
+      console.log(`  Length: ${rawSpeakerText.length} caracteres`)
+      console.log(
+        `  First 60 chars: "${rawSpeakerText
+          .substring(0, 60)
+          .replace(/\n/g, " ")}"`,
+      )
+      console.log(
+        `  Last 60 chars: "${rawSpeakerText
+          .substring(rawSpeakerText.length - 60)
+          .replace(/\n/g, " ")}"`,
+      )
+
+      // VALIDAR LONGITUD
+      if (rawSpeakerText.length < 200) {
         console.warn(
-          `[Aviso] Final no encontrado. Extrayendo hasta el final del bloque. Longitud: ${rawSpeakerText.length}`,
-        )
-      } else {
-        console.warn(
-          `[Error] Límites no encontrados para ${segment.speaker} en este bloque. Saltando intervención.`,
+          `[Error] Texto muy corto (${rawSpeakerText.length} chars). Probablemente falso positivo. Saltando.`,
         )
         continue
       }
 
-      if (rawSpeakerText.length < 50) {
+      if (rawSpeakerText.length > 50000) {
         console.warn(
-          `[Error] El texto capturado para ${segment.speaker} es demasiado corto (${rawSpeakerText.length} chars). Probablemente fue un falso positivo. Saltando.`,
+          `[Aviso] Texto muy largo (${rawSpeakerText.length} chars). Intentando dividir...`,
         )
-        continue
+
+        // Intentar dividir por el siguiente speaker
+        const nextSpeakerMatch = nextSpeakers[0]
+        if (nextSpeakerMatch) {
+          const splitIdx = rawSpeakerText
+            .toLowerCase()
+            .indexOf(nextSpeakerMatch.toLowerCase())
+          if (splitIdx > 5000) {
+            // Solo dividir si tiene sentido
+            rawSpeakerText = rawSpeakerText.substring(0, splitIdx)
+            console.log(`   Truncado a ${rawSpeakerText.length} caracteres`)
+          }
+        }
       }
+
+      console.log(`✓ Texto válido: ${rawSpeakerText.length} caracteres`)
 
       const cleanedText = await cleanTextInChunks(rawSpeakerText, cleanerModel)
 
@@ -1862,7 +429,7 @@ CRITICAL DIRECTIVES:
     const finalData = Object.values(mergedSpeakersMap)
 
     console.log(
-      `\nProceso completado. Archivo final contendrá ${finalData.length} orador(es) único(s).`,
+      `\nProceso completado. ${finalData.length} orador(es) único(s) procesado(s).`,
     )
 
     res.json({
@@ -1871,7 +438,7 @@ CRITICAL DIRECTIVES:
       data: finalData,
     })
   } catch (error) {
-    console.error("Error durante el proceso multipaso:", error)
+    console.error("Error durante el proceso:", error)
     res.status(500).json({
       error: "Ocurrió un error al limpiar la transcripción.",
       details: error.message,
