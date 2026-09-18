@@ -62,9 +62,22 @@ Topics: ${metadataBase.topics.join(", ")}
   // -----------------------------
   // Construcción final
   // -----------------------------
+
+  const fileSlug = path
+    .basename(filePath, path.extname(filePath))
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // quita acentos
+    .replace(/[^a-zA-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .toLowerCase()
+
+  const dateSlug = metadataBase.date || "sin-fecha"
+
+  const talkSlug = `${fileSlug}-${dateSlug}`
+
   const documentos = chunks.map((chunk, index) => {
     return {
-      id: `${metadataBase.conference_id}-${index + 1}`,
+      id: `${talkSlug}-${index + 1}`,
 
       pageContent: `
   ${contexto}
@@ -81,7 +94,7 @@ Topics: ${metadataBase.topics.join(", ")}
 
         total_chunks: chunks.length,
 
-        chunk_id: `${metadataBase.conference_id}-${index + 1}`,
+        chunk_id: `${talkSlug}-${index + 1}`,
       },
     }
   })
@@ -99,7 +112,7 @@ Topics: ${metadataBase.topics.join(", ")}
 
 async function procesarTodosLosArchivos() {
   // Especifica la carpeta donde están los archivos .txt
-  const carpeta = "./morgan3"
+  const carpeta = "./conferences/Amsterdam_2026"
 
   try {
     // Lee todos los archivos de la carpeta
