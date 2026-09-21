@@ -265,7 +265,7 @@ CRITICAL RULES FOR ACCURACY:
 3. CONTEXT AWARENESS: Look for MC introductions like "Please welcome..." or "Here's..."
 4. EXACT QUOTES: Extract FIRST 20 WORDS (start_quote) and LAST 20 WORDS (end_quote) 
    spoken by them IN THIS CHUNK ONLY. These should be EXACT verbatim quotes.
-5. ID FORMAT: Sequential "talk-10-munich26", "talk-11-munich26", etc. Date "July 8, 2026" for Day 1.
+5. ID FORMAT: Sequential "talk-10-amsterdam2026", "talk-11-amsterdam2026", etc. Date "July 8, 2026" for Day 1.
 6. AVOID DUPLICATES: If you find the same speaker multiple times, only report once per chunk.
 
 IMPORTANT: Only return speakers you are CONFIDENT about (>85% certainty).
@@ -402,7 +402,7 @@ CRITICAL DIRECTIVES:
       const cleanedText = await cleanTextInChunks(rawSpeakerText, cleanerModel)
 
       intermediateData.push({
-        id: `talk-${idCounter++}-munich26`,
+        id: `talk-${idCounter++}-amsterdam2026`,
         speaker: segment.speaker,
         metadata: segment.metadata,
         cleaned_content: cleanedText,
